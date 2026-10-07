@@ -1,0 +1,45 @@
+# FastAPI and server
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Database
+SQLAlchemy==2.0.25
+PyMySQL==1.1.0
+cryptography==42.0.0
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-dotenv==1.0.0
+
+# Data processing
+pandas==2.2.0
+openpyxl==3.1.2
+reportlab==4.0.9
+jinja2==3.1.3
+
+# Validation
+pydantic==2.5.3
+pydantic[email]==2.5.3
+
+# Background tasks
+celery==5.3.6
+redis==5.0.1
+
+# Scheduler
+APScheduler==3.10.4
+
+# SMS Integration
+requests==2.31.0
+twilio>=8.0.0  # Optional: for Twilio provider
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2024.1
+
+# Development
+pytest==8.0.0
+pytest-asyncio
+httpx==0.26.0
