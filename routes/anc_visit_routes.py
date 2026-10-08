@@ -14,6 +14,8 @@ from sms_service import sms_service
 from sms_templates import get_sms_template
 from ivr_service import trigger_high_risk_call
 
+from services.tracking_service import get_tracking_info
+from sqlalchemy import func
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/anc-visits", tags=["ANC Visits"])
@@ -174,6 +176,81 @@ def _apply_high_risk_flag(db, pw: PregnantWoman, risk_reasons: List[str], curren
     except Exception:
         pass  # IVR is best-effort — never block the main flow
 
+def send_overdue_notifications(db: Session) -> dict:
+    """Overdue ANC visit -> notify ONLY the PW's own sub-centre users."""
+    today = date.today()
+
+    visits = db.query(ANCVisit).filter(
+        ANCVisit.next_visit_date.isnot(None),
+        ANCVisit.next_visit_date < today,
+    ).all()
+
+    notified = 0
+    skipped = 0
+
+    for visit in visits:
+        # Only the latest visit of the PW counts
+        newer = db.query(ANCVisit).filter(
+            ANCVisit.pregnant_woman_id == visit.pregnant_woman_id,
+            ANCVisit.visit_number > visit.visit_number,
+        ).first()
+        if newer:
+            continue
+
+        pw = db.query(PregnantWoman).filter(
+            PregnantWoman.id == visit.pregnant_woman_id
+        ).first()
+        if not pw or not pw.is_active or pw.pregnancy_outcome is not None:
+            continue
+        if not pw.sub_centre_id:
+            skipped += 1
+            continue
+
+        # Only this PW's own sub-centre users
+        sc_users = db.query(User).filter(
+            User.sub_centre_id == pw.sub_centre_id,
+            User.role == "sub_centre",
+            User.is_active == True,
+        ).all()
+        if not sc_users:
+            skipped += 1
+            continue
+
+        # Don't send the same alert twice on the same day
+        already = db.query(Notification).filter(
+            Notification.notification_type == "anc_visit_overdue",
+            Notification.reference_id == visit.id,
+            Notification.reference_type == "anc_visit",
+            func.date(Notification.created_at) == today,
+        ).first()
+        if already:
+            continue
+
+        days_overdue = (today - visit.next_visit_date).days
+        NotificationService.create_notification(
+            db=db,
+            user_ids=[u.id for u in sc_users],
+            title="ANC Visit Overdue",
+            message=(
+                f"{pw.full_name}'s ANC visit was due on "
+                f"{visit.next_visit_date.strftime('%d/%m/%Y')} "
+                f"({days_overdue} day(s) overdue)"
+            ),
+            notification_type="anc_visit_overdue",
+            category="anc_visit",
+            priority="high",
+            reference_id=visit.id,
+            reference_type="anc_visit",
+            action_url=f"/pregnant-women/{pw.id}",
+            metadata={
+                "pregnant_woman_name": pw.full_name,
+                "days_overdue": days_overdue,
+            },
+        )
+        notified += 1
+
+    return {"notified": notified, "skipped_no_subcentre_or_user": skipped}
+    
 @router.post("/", response_model=ANCVisitResponse, status_code=status.HTTP_201_CREATED)
 async def create_anc_visit(
     visit_data: ANCVisitCreate,
@@ -715,6 +792,16 @@ async def notify_due_anc_visits(
         "message": f"Notified about {notified_count} ANC visits due today",
         "count": notified_count
     }
+
+@router.post("/notify-overdue-visits")
+async def notify_overdue_anc_visits(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Overdue ANC notification -> only the PW's own sub-centre users."""
+    if current_user.role not in ["district", "block", "sub_centre"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return send_overdue_notifications(db)
 
 @router.get("/overdue/list")
 async def get_overdue_visits(

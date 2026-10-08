@@ -10,6 +10,7 @@ from models import PMSMASession, PregnantWoman, User, PMSMACentre
 from auth import get_current_active_user
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 from services.notification_service import NotificationService
+from services.tracking_service import get_tracking_info
 
 router = APIRouter(prefix="/pmsma-sessions", tags=["PMSMA Sessions"])
 
@@ -95,6 +96,7 @@ def _fmt(session: PMSMASession, db: Session) -> dict:
     centre = None
     if session.pmsma_centre_id:
         centre = db.query(PMSMACentre).filter(PMSMACentre.id == session.pmsma_centre_id).first()
+    tracking = get_tracking_info(pw)    
     return {
         "id": session.id,
         "pregnant_woman_id": session.pregnant_woman_id,
@@ -125,6 +127,8 @@ def _fmt(session: PMSMASession, db: Session) -> dict:
         "override_reason": session.override_reason,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
+        "gestational_weeks": tracking["gestational_weeks"],
+        "tracking_type": tracking["tracking_type"],
     }
 
 

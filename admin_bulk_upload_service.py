@@ -509,9 +509,12 @@ def _build_changes(db, cfg_key, cfg, rec, d):
 # ----------------------------------------------------------------------------
 # Phase 1: analysis (dry run)
 # ----------------------------------------------------------------------------
-def analyze_dataframe(db, entity, df, user):
+def analyze_dataframe(db, entity, df, user, cache=None):
+    # cfg = get_config(entity)
+    # results, seen, cache = [], {}, {}
     cfg = get_config(entity)
-    results, seen, cache = [], {}, {}
+    results, seen = [], {}
+    cache = {} if cache is None else cache
 
     for index, row in df.iterrows():
         n = index + 2

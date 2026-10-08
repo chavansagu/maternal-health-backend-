@@ -55,14 +55,21 @@ from file_validator import validate_upload_file
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 
 from services.notification_service import NotificationService
+from services.tracking_service import get_tracking_info
 
 def format_appointment_response(appointment, db=None):
     """Format appointment with file URLs and pregnant woman name"""
     import json
+    # pregnant_woman_name = None
+    # if db is not None:
+    #     pw = db.query(PregnantWoman).filter(PregnantWoman.id == appointment.pregnant_woman_id).first()
+    #     pregnant_woman_name = pw.full_name if pw else None
     pregnant_woman_name = None
+    tracking = {"gestational_weeks": None, "tracking_type": "regular"}
     if db is not None:
         pw = db.query(PregnantWoman).filter(PregnantWoman.id == appointment.pregnant_woman_id).first()
         pregnant_woman_name = pw.full_name if pw else None
+        tracking = get_tracking_info(pw)
 
     # Build multi-file URL lists
     prescription_file_urls = []
@@ -93,6 +100,8 @@ def format_appointment_response(appointment, db=None):
         "completed_date": appointment.completed_date,
         "sms_sent": appointment.sms_sent,
         "created_at": appointment.created_at,
+        "gestational_weeks": tracking["gestational_weeks"],
+        "tracking_type": tracking["tracking_type"],
         # scan details
         "scan_type": appointment.scan_type,
         "trimester": appointment.trimester,

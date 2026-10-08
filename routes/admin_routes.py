@@ -32,6 +32,7 @@ from audit_utils import (
 )
 from services.notification_service import NotificationService
 import admin_bulk_upload_service as admin_bulk
+import admin_masters_bulk_service as admin_masters
 
 logger = logging.getLogger(__name__)
 
@@ -1667,3 +1668,155 @@ def bulk_upload_legacy(
 ):
     """Legacy one-step upload: inserts new rows, skips existing ones (no updates)."""
     return _run_admin_bulk_upload(request, entity, file, db, current_user, "skip", None)
+
+
+
+# ─────────────────────────────────────────────
+# MASTERS BULK UPLOAD (Users page -> Bulk Upload)
+# One file with Blocks, Wards, Sub-Centres, USG, Delivery Points, PMSMA Centres.
+# Logic lives in admin_masters_bulk_service.py; it reuses the per-entity engine above.
+# NOTE: path is /bulk-upload-masters/... on purpose, so it can never clash with
+#       the existing /bulk-upload/{entity}/... routes.
+# ─────────────────────────────────────────────
+
+
+def _masters_checks(file: UploadFile, current_user: User):
+    if current_user.role != "district":
+        raise HTTPException(status_code=403, detail="Only district users can bulk upload administrative data")
+    if not current_user.district_id:
+        raise HTTPException(status_code=403, detail="Your account is not linked to a district")
+    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only CSV or Excel (.csv, .xlsx, .xls) files are allowed")
+
+@router.get("/bulk-upload-masters/template", tags=["Bulk Upload"])
+async def download_masters_template(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    dq = db.query(District)
+    bq = db.query(Block)
+    if current_user.district_id:
+        dq = dq.filter(District.id == current_user.district_id)
+        bq = bq.filter(Block.district_id == current_user.district_id)
+    district_names = [d.name for d in dq.order_by(District.name).all()]
+    block_names = [b.name for b in bq.order_by(Block.name).all()]
+    content = admin_masters.build_template_xlsx(district_names, block_names)
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=administrative_masters_template.xlsx"}
+    )
+
+@router.post("/bulk-upload-masters/validate", tags=["Bulk Upload"])
+def masters_bulk_validate(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """STEP 1 (dry run): validate the whole file, classify every row. Saves nothing."""
+    _masters_checks(file, current_user)
+    try:
+        df = admin_masters.read_masters_dataframe(file.filename, file.file.read())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        rows, _per_entity = admin_masters.analyze_masters(db, df, current_user)
+        db.rollback()  # dry run: nothing pending
+        return {
+            "entity": "masters",
+            "file_name": file.filename,
+            "total_records": len(rows),
+            "summary": admin_masters.summarize(rows),
+            "rows": admin_masters.serialize_rows(rows),
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[MASTERS BULK VALIDATE] {e} | {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error validating file: {str(e)}")
+
+
+@router.post("/bulk-upload-masters/confirm", tags=["Bulk Upload"])
+def masters_bulk_confirm(
+    request: Request,
+    file: UploadFile = File(...),
+    update_mode: str = Form("fill_empty"),
+    selected_rows: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """STEP 2: create everything in dependency order (block -> ward -> sub-centre -> USG -> DP -> PMSMA)."""
+    _masters_checks(file, current_user)
+    if update_mode not in admin_bulk.UPDATE_MODES:
+        raise HTTPException(status_code=400,
+                            detail=f"update_mode must be one of {', '.join(admin_bulk.UPDATE_MODES)}")
+    rows_filter = None
+    if selected_rows:
+        try:
+            rows_filter = {int(x) for x in json.loads(selected_rows)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="selected_rows must be a JSON list of row numbers")
+    try:
+        df = admin_masters.read_masters_dataframe(file.filename, file.file.read())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    audit_name = "AdminMasters"
+    bulk_upload = BulkUpload(file_name=f"[{audit_name}] {file.filename}"[:255], uploaded_by=current_user.id,
+                             total_records=len(df), processing_status="processing")
+    db.add(bulk_upload)
+    db.commit()
+    db.refresh(bulk_upload)
+    logger.info(f"[MASTERS BULK] Started | file='{file.filename}' | rows={len(df)} | user={current_user.id} | mode={update_mode}")
+
+    try:
+        # Re-analyse server-side: never trust the client's preview.
+        rows, per_entity = admin_masters.analyze_masters(db, df, current_user)
+        bad_rows = [r for r in rows if r["status"] == "invalid" and not r["_data"]]  # unknown / missing record_type
+        out = admin_masters.execute_masters(db, per_entity, current_user, update_mode, rows_filter, bad_rows)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[MASTERS BULK] FAILED | {e} | {traceback.format_exc()}")
+        bulk_upload.processing_status = "failed"
+        bulk_upload.error_log = f"{type(e).__name__}: {str(e)[:500]}"
+        bulk_upload.completed_at = datetime.now()
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+    inserted, updated = out["inserted"], out["updated"]
+    duplicate, failed = out["duplicate"], out["failed"]
+    bulk_upload.successful_records = inserted + updated
+    bulk_upload.failed_records = failed
+    bulk_upload.duplicate_records = duplicate
+    bulk_upload.processing_status = "completed"
+    bulk_upload.error_log = "\n".join(out["errors"]) if out["errors"] else None
+    bulk_upload.completed_at = datetime.now()
+    db.commit()
+
+    ip_address, user_agent = get_client_info(request)
+    for ent_audit, rec_id, old_vals, new_vals in out["audit"]:
+        log_audit(db, current_user.id, "BULK_UPDATE", ent_audit, rec_id,
+                  old_vals, {**new_vals, "bulk_upload_id": bulk_upload.id}, ip_address, user_agent)
+    log_bulk_action(
+        db, current_user.id, "BULK_UPLOAD", audit_name, inserted + updated,
+        {"total_records": len(df), "inserted": inserted, "updated": updated, "failed": failed,
+         "duplicate": duplicate, "update_mode": update_mode, "by_type": out["by_type"],
+         "bulk_upload_id": bulk_upload.id},
+        ip_address, user_agent
+    )
+
+    return {
+        "message": "Bulk upload completed",
+        "entity": "masters",
+        "total_records": len(df),
+        "inserted": inserted,
+        "updated": updated,
+        "successful": inserted + updated,
+        "failed": failed,
+        "duplicate": duplicate,
+        "by_type": out["by_type"],
+        "bulk_upload_id": bulk_upload.id,
+        "failed_rows": out["failed_rows"],
+        "total": len(df),
+        "errors": out["errors"],
+    }

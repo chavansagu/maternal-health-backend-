@@ -444,6 +444,8 @@ class USGAppointmentResponse(USGAppointmentBase):
     created_at: datetime
     prescription_file_url: Optional[str] = None
     report_file_url: Optional[str] = None
+    gestational_weeks: Optional[int] = None
+    tracking_type: Optional[str] = None
 
 # Feedback Schemas
 class FeedbackRecordBase(BaseSchema):
