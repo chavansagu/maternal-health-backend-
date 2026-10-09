@@ -37,7 +37,8 @@ from routes import (
     pmsma_routes,
     mobilisation_routes,
     pnc_reminder_routes,
-    district_analytics_routes
+    district_analytics_routes,
+    enhanced_tracking_routes,
 )
 
 @asynccontextmanager
@@ -198,6 +199,7 @@ app.include_router(pmsma_routes.router, prefix=api_v1_prefix)
 app.include_router(mobilisation_routes.router, prefix=api_v1_prefix)
 app.include_router(pnc_reminder_routes.router, prefix=api_v1_prefix)
 app.include_router(district_analytics_routes.router, prefix=api_v1_prefix)
+app.include_router(enhanced_tracking_routes.router, prefix=api_v1_prefix)
 
 # Run the application
 if __name__ == "__main__":

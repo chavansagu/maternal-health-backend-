@@ -917,6 +917,35 @@ class PMSMASession(Base):
     # Scheduling metadata
     scheduled_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     completed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+        # Examination (spec F)
+    visit_number = Column(Integer, default=1, nullable=False)
+    visit_type = Column(String(20), default="regular", nullable=False)  # regular / additional
+    visit_date = Column(Date, nullable=True)
+    findings = Column(Text, nullable=True)
+
+    # HRP conditions (yes/no)
+    hrp_severe_anaemia = Column(Boolean, default=False, nullable=False)
+    hrp_pih = Column(Boolean, default=False, nullable=False)
+    hrp_gdm = Column(Boolean, default=False, nullable=False)
+    hrp_hiv_reactive = Column(Boolean, default=False, nullable=False)
+    hrp_syphilis = Column(Boolean, default=False, nullable=False)
+    hrp_hypothyroidism = Column(Boolean, default=False, nullable=False)
+    hrp_tuberculosis = Column(Boolean, default=False, nullable=False)
+    hrp_malaria = Column(Boolean, default=False, nullable=False)
+    hrp_previous_lscs = Column(Boolean, default=False, nullable=False)
+    hrp_hepatitis_b = Column(Boolean, default=False, nullable=False)
+    hrp_teenage_pregnancy = Column(Boolean, default=False, nullable=False)
+    hrp_still_birth_history = Column(Boolean, default=False, nullable=False)
+    hrp_rh_negative = Column(Boolean, default=False, nullable=False)
+    hrp_early_primi = Column(Boolean, default=False, nullable=False)
+    hrp_elderly_primi = Column(Boolean, default=False, nullable=False)
+    hrp_multiple_pregnancy = Column(Boolean, default=False, nullable=False)
+
+    # Recommendations
+    recommended_action = Column(Text, nullable=True)
+    recommended_dp_id = Column(Integer, ForeignKey("delivery_points.id"), nullable=True)
+    usg_required = Column(Boolean, default=False, nullable=False)
+    
     reschedule_reason = Column(Text, nullable=True)
     is_emergency_override = Column(Boolean, default=False)
     override_reason = Column(Text, nullable=True)

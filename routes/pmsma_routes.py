@@ -6,7 +6,7 @@ from datetime import datetime, date
 from pydantic import BaseModel
 
 from database import get_db
-from models import PMSMASession, PregnantWoman, User, PMSMACentre
+from models import PMSMASession, PregnantWoman, User, PMSMACentre ,DeliveryPoint
 from auth import get_current_active_user
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 from services.notification_service import NotificationService
@@ -16,7 +16,24 @@ router = APIRouter(prefix="/pmsma-sessions", tags=["PMSMA Sessions"])
 
 PMSMA_ROLE = "pmsma"
 
-
+HRP_CONDITIONS = {
+    "hrp_severe_anaemia": "Severe Anaemia",
+    "hrp_pih": "PIH",
+    "hrp_gdm": "GDM",
+    "hrp_hiv_reactive": "Reactive for HIV",
+    "hrp_syphilis": "Syphilis",
+    "hrp_hypothyroidism": "Hypothyroidism",
+    "hrp_tuberculosis": "Tuberculosis",
+    "hrp_malaria": "Malaria",
+    "hrp_previous_lscs": "Previous LSCS",
+    "hrp_hepatitis_b": "Hepatitis B",
+    "hrp_teenage_pregnancy": "Teenage Pregnancy",
+    "hrp_still_birth_history": "History of Still Birth",
+    "hrp_rh_negative": "Rh Negative",
+    "hrp_early_primi": "Early Primi",
+    "hrp_elderly_primi": "Elderly Primi",
+    "hrp_multiple_pregnancy": "Twins / Multiple Pregnancy",
+}
 # ── Request body schemas ─────────────────────────────────────────────────────
 
 class PMSMASessionCreate(BaseModel):
@@ -34,9 +51,27 @@ class PMSMASessionComplete(BaseModel):
     weight: Optional[float] = None
     additional_parameters: Optional[str] = None
     counselling_notes: Optional[str] = None
-    is_high_risk: bool = False
-
-
+    visit_date: Optional[date] = None
+    findings: Optional[str] = None
+    recommended_action: Optional[str] = None
+    recommended_dp_id: Optional[int] = None
+    usg_required: bool = False
+    hrp_severe_anaemia: bool = False
+    hrp_pih: bool = False
+    hrp_gdm: bool = False
+    hrp_hiv_reactive: bool = False
+    hrp_syphilis: bool = False
+    hrp_hypothyroidism: bool = False
+    hrp_tuberculosis: bool = False
+    hrp_malaria: bool = False
+    hrp_previous_lscs: bool = False
+    hrp_hepatitis_b: bool = False
+    hrp_teenage_pregnancy: bool = False
+    hrp_still_birth_history: bool = False
+    hrp_rh_negative: bool = False
+    hrp_early_primi: bool = False
+    hrp_elderly_primi: bool = False
+    hrp_multiple_pregnancy: bool = False
 class PMSMASessionReschedule(BaseModel):
     new_scheduled_date: datetime
     reschedule_reason: str
@@ -96,7 +131,10 @@ def _fmt(session: PMSMASession, db: Session) -> dict:
     centre = None
     if session.pmsma_centre_id:
         centre = db.query(PMSMACentre).filter(PMSMACentre.id == session.pmsma_centre_id).first()
-    tracking = get_tracking_info(pw)    
+    tracking = get_tracking_info(pw)  
+    dp = None
+    if session.recommended_dp_id:
+        dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == session.recommended_dp_id).first()  
     return {
         "id": session.id,
         "pregnant_woman_id": session.pregnant_woman_id,
@@ -116,6 +154,15 @@ def _fmt(session: PMSMASession, db: Session) -> dict:
         "weight": session.weight,
         "additional_parameters": session.additional_parameters,
         "counselling_notes": session.counselling_notes,
+        "visit_number": session.visit_number,
+        "visit_type": session.visit_type,
+        "visit_date": session.visit_date,
+        "findings": session.findings,
+        "recommended_action": session.recommended_action,
+        "recommended_dp_id": session.recommended_dp_id,
+        "usg_required": bool(session.usg_required),
+        "hrp_conditions": [label for key, label in HRP_CONDITIONS.items() if getattr(session, key)],
+        **{key: bool(getattr(session, key)) for key in HRP_CONDITIONS},
         # Effective status: the woman's live high-risk flag (set from ANC/USG/registration
         # or an earlier PMSMA session) OR the flag recorded on this session. Reading only
         # the session column showed False for every scheduled session of a high-risk woman.
@@ -129,6 +176,7 @@ def _fmt(session: PMSMASession, db: Session) -> dict:
         "updated_at": session.updated_at,
         "gestational_weeks": tracking["gestational_weeks"],
         "tracking_type": tracking["tracking_type"],
+        "recommended_dp_name": dp.name if dp else None,
     }
 
 
@@ -487,7 +535,7 @@ async def complete_pmsma_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """Record test results and counselling notes for a PMSMA session (PMSMA role only)."""
+    """Record examination, findings and HRP conditions for a PMSMA session (PMSMA role only)."""
     _require_pmsma(current_user)
 
     session = db.query(PMSMASession).filter(PMSMASession.id == session_id).first()
@@ -502,9 +550,23 @@ async def complete_pmsma_session(
     if session.status == "cancelled":
         raise HTTPException(status_code=400, detail="Cannot complete a cancelled session")
 
+    if body.recommended_dp_id:
+        dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == body.recommended_dp_id).first()
+        if not dp or not getattr(dp, "is_active", True):
+            raise HTTPException(status_code=400, detail="Selected delivery point not found or inactive")
+
     old_values = get_entity_snapshot(session)
     pw = db.query(PregnantWoman).filter(PregnantWoman.id == session.pregnant_woman_id).first()
     already_high_risk = bool(pw.is_high_risk) if pw else False
+    detected = [label for key, label in HRP_CONDITIONS.items() if getattr(body, key)]
+
+    # Visit number = earlier completed PMSMA visits of this woman + 1
+    prior = db.query(PMSMASession).filter(
+        PMSMASession.pregnant_woman_id == session.pregnant_woman_id,
+        PMSMASession.status == "completed",
+        PMSMASession.id != session.id,
+    ).count()
+
     session.status = "completed"
     session.bp = body.bp
     session.blood_sugar = body.blood_sugar
@@ -512,7 +574,16 @@ async def complete_pmsma_session(
     session.weight = body.weight
     session.additional_parameters = body.additional_parameters
     session.counselling_notes = body.counselling_notes
-    session.is_high_risk = bool(body.is_high_risk) or already_high_risk
+    session.visit_date = body.visit_date or date.today()
+    session.visit_number = prior + 1
+    session.visit_type = "regular" if prior == 0 else "additional"
+    session.findings = body.findings
+    session.recommended_action = body.recommended_action
+    session.recommended_dp_id = body.recommended_dp_id
+    session.usg_required = body.usg_required
+    for key in HRP_CONDITIONS:
+        setattr(session, key, getattr(body, key))
+    session.is_high_risk = bool(detected) or already_high_risk
     session.completed_by = current_user.id
     session.updated_at = datetime.now()
     db.commit()
@@ -535,36 +606,38 @@ async def complete_pmsma_session(
                 metadata={"pregnant_woman_name": pw.full_name},
             )
 
-    if body.is_high_risk:
-        if pw and not pw.is_high_risk:
-            pw.is_high_risk = True
-            pw.risk_factors = (pw.risk_factors or "") + "; PMSMA session flagged high-risk"
-            db.commit()
+    if detected and pw:
+        newly_flagged = not pw.is_high_risk
+        pw.is_high_risk = True
+        existing = pw.risk_factors or ""
+        new_labels = [d for d in detected if d not in existing]
+        if new_labels:
+            pw.risk_factors = (existing + "; " if existing else "") + "PMSMA: " + ", ".join(new_labels)
+        db.commit()
 
-            recipients = NotificationService.get_recipients_for_event(
-                db, "high_risk_alert",
-                {"district_id": pw.district_id, "block_id": pw.block_id, "sub_centre_id": pw.sub_centre_id},
+        recipients = NotificationService.get_recipients_for_event(
+            db, "high_risk_alert",
+            {"district_id": pw.district_id, "block_id": pw.block_id, "sub_centre_id": pw.sub_centre_id},
+        )
+        if recipients:
+            NotificationService.create_notification(
+                db=db,
+                user_ids=recipients,
+                title="⚠️ High-Risk Case — PMSMA",
+                message=f"{pw.full_name}: HRP detected at PMSMA — {', '.join(detected)}.",
+                notification_type="high_risk_alert",
+                category="pmsma",
+                priority="high",
+                reference_id=pw.id,
+                reference_type="pregnant_woman",
+                action_url=f"/pregnant-women/{pw.id}",
+                metadata={"pregnant_woman_name": pw.full_name, "conditions": detected, "newly_flagged": newly_flagged},
             )
-            if recipients:
-                NotificationService.create_notification(
-                    db=db,
-                    user_ids=recipients,
-                    title="⚠️ High-Risk Case — PMSMA",
-                    message=f"{pw.full_name} flagged high-risk during PMSMA session.",
-                    notification_type="high_risk_alert",
-                    category="pmsma",
-                    priority="high",
-                    reference_id=pw.id,
-                    reference_type="pregnant_woman",
-                    action_url=f"/pregnant-women/{pw.id}",
-                    metadata={"pregnant_woman_name": pw.full_name},
-                )
 
     ip_address, user_agent = get_client_info(request) if request else (None, None)
     log_update(db, current_user.id, "PMSMASession", session.id, old_values, get_entity_snapshot(session), ip_address, user_agent)
 
     return _fmt(session, db)
-
 
 # ── POST /pmsma-sessions/{id}/reschedule ─────────────────────────────────────
 
