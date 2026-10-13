@@ -10,11 +10,13 @@ from schemas import ANCVisitCreate, ANCVisitResponse, ANCVisitUpdate
 from auth import get_current_active_user
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update, log_delete
 from services.notification_service import NotificationService
+from services.alert_rules import raise_alert,close_alerts
+from services.hrp_service import add_conditions
 from sms_service import sms_service
 from sms_templates import get_sms_template
 from ivr_service import trigger_high_risk_call
 
-from services.tracking_service import get_tracking_info
+from services.tracking_service import get_tracking_info, get_gestational_weeks, ENHANCED_FROM_WEEK
 from sqlalchemy import func
 logger = logging.getLogger(__name__)
 
@@ -93,37 +95,22 @@ def _apply_high_risk_flag(db, pw: PregnantWoman, risk_reasons: List[str], curren
     fire in-app notifications, SMS, and IVR call. Only acts when pw is not already high-risk.
     """
     from models import IVRCallLog
-    pw.is_high_risk = True
-    pw.risk_factors = "Auto-detected: " + ", ".join(risk_reasons)
+    add_conditions(db, pw, risk_reasons, "anc_auto", user_id=current_user.id, reference_type="anc_visit")
     db.commit()
-
-    # In-app notification to district + block + sub-centre users
-    recipients = NotificationService.get_recipients_for_event(
-        db,
-        "high_risk_alert",
-        {
-            "district_id": pw.district_id,
-            "block_id": pw.block_id,
-            "sub_centre_id": pw.sub_centre_id,
-        }
+    # HRP identified -> Sub-centre + Block + District (alert matrix, spec M)
+    raise_alert(
+        db, "hrp_identified", pw,
+        title="⚠️ High-Risk Case Auto-Detected",
+        message=(
+            f"{pw.full_name} has been automatically flagged as high-risk "
+            f"based on ANC visit values. Reasons: {', '.join(risk_reasons)}"
+        ),
+        alert_key=f"hrp_identified:{pw.id}",
+        reference_id=pw.id,
+        reference_type="pregnant_woman",
+        action_url=f"/pregnant-women/{pw.id}",
+        metadata={"pregnant_woman_name": pw.full_name, "risk_factors": pw.risk_factors},
     )
-    if recipients:
-        NotificationService.create_notification(
-            db=db,
-            user_ids=recipients,
-            title="⚠️ High-Risk Case Auto-Detected",
-            message=(
-                f"{pw.full_name} has been automatically flagged as high-risk "
-                f"based on ANC visit values. Reasons: {', '.join(risk_reasons)}"
-            ),
-            notification_type="high_risk_alert",
-            category="anc_visit",
-            priority="high",
-            reference_id=pw.id,
-            reference_type="pregnant_woman",
-            action_url=f"/pregnant-women/{pw.id}",
-            metadata={"pregnant_woman_name": pw.full_name, "risk_factors": pw.risk_factors}
-        )
 
     # SMS to beneficiary
     try:
@@ -284,7 +271,28 @@ async def create_anc_visit(
                 raise HTTPException(status_code=403, detail="Not authorized")
     elif current_user.role == "block" and pw.block_id != current_user.block_id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+    # Visit number validation (spec C): 1-4 regular ANC, weekly visits from 28 weeks
+    weeks_at_visit = get_gestational_weeks(pw, visit_data.visit_date)
+    is_weekly_visit = weeks_at_visit is not None and weeks_at_visit >= ENHANCED_FROM_WEEK
+
+    if visit_data.visit_number < 1 or visit_data.visit_number > 17:
+        raise HTTPException(status_code=400, detail="ANC visit number must be between 1 and 17")
+
+    if not is_weekly_visit:
+        if visit_data.visit_number > 4:
+            raise HTTPException(
+                status_code=400,
+                detail="Before 28 weeks, ANC visit number must be 1 to 4"
+            )
+        already_done = db.query(ANCVisit.id).filter(
+            ANCVisit.pregnant_woman_id == pw.id,
+            ANCVisit.visit_number == visit_data.visit_number,
+        ).first()
+        if already_done:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ANC visit #{visit_data.visit_number} is already recorded for this woman"
+            )
     # Create ANC visit
     new_visit = ANCVisit(
         **visit_data.dict(),
@@ -294,7 +302,9 @@ async def create_anc_visit(
     db.add(new_visit)
     db.commit()
     db.refresh(new_visit)
-
+    # Required entry done -> close this woman's open ANC alerts (alert matrix, spec M)
+    for _ev in ("anc_due", "anc_overdue", "anc_visit_due", "anc_visit_missed"):
+        close_alerts(db, f"{_ev}:{pw.id}", note="ANC visit recorded")
     ip_address, user_agent = get_client_info(request)
     log_create(
         db,
@@ -360,6 +370,10 @@ async def create_anc_visit(
     # --- Auto High-Risk Detection ---
     high_risk_triggered = False
     risk_reasons = evaluate_high_risk(new_visit)
+    if risk_reasons and pw.is_high_risk:
+        add_conditions(db, pw, risk_reasons, "anc_auto", user_id=current_user.id,
+                       reference_type="anc_visit", reference_id=new_visit.id)
+        db.commit()
 
     if risk_reasons and not pw.is_high_risk:
         _apply_high_risk_flag(db, pw, risk_reasons, current_user)
@@ -370,7 +384,8 @@ async def create_anc_visit(
         )
     elif visit_data.is_emergency and not pw.is_high_risk:
         # Fallback: emergency flag still marks high-risk even if vitals are normal
-        pw.is_high_risk = True
+        add_conditions(db, pw, ["Emergency ANC visit"], "anc_auto", user_id=current_user.id,
+                       reference_type="anc_visit", reference_id=new_visit.id)
         db.commit()
 
     return {
@@ -535,6 +550,21 @@ async def update_anc_visit(
     # --- Auto High-Risk Detection ---
     high_risk_triggered = False
     risk_reasons = evaluate_high_risk(visit)
+
+    # Woman pehle se HRP hai to bhi ANC ke naye risk conditions record karo
+    if risk_reasons and pw.is_high_risk:
+        add_conditions(
+            db, pw, risk_reasons, "anc_auto",
+            user_id=current_user.id,
+            reference_type="anc_visit",
+            reference_id=visit.id,
+        )
+        db.commit()
+
+    # Visit update hui hai, to purane ANC due/overdue alerts band karo
+    for _ev in ("anc_due", "anc_overdue", "anc_visit_due", "anc_visit_missed"):
+        close_alerts(db, f"{_ev}:{pw.id}", note="ANC visit updated")
+    db.commit()
 
     if risk_reasons and not pw.is_high_risk:
         _apply_high_risk_flag(db, pw, risk_reasons, current_user)
@@ -914,6 +944,8 @@ async def get_anc_visit(
         "weight": visit.weight,
         "blood_pressure": visit.blood_pressure,
         "hemoglobin": visit.hemoglobin,
+        "urine_albumin": visit.urine_albumin,
+        "urine_sugar": visit.urine_sugar,
         "fundal_height": visit.fundal_height,
         "fetal_heart_rate": visit.fetal_heart_rate,
         "referred_for_usg": visit.referred_for_usg,

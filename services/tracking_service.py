@@ -189,4 +189,133 @@ def get_weekly_visit_status(pw, last_anc_date=None, today=None) -> dict:
         result["anc_status"] = "due_soon"
     else:
         result["anc_status"] = "on_track"
-    return result    
+    return result   
+
+
+
+# ---- EDD buckets (config: yahin se badal sakte hain) ----
+# (key, label, min_days, max_days)  -> days_remaining ke hisaab se
+EDD_BUCKETS = [
+    ("more_than_30", "More than 30 days", 31, None),
+    ("30_16", "30-16 days", 16, 30),
+    ("15_11", "15-11 days", 11, 15),
+    ("10_8", "10-8 days", 8, 10),
+    ("7_4", "7-4 days", 4, 7),
+    ("3_1", "3-1 days", 1, 3),
+    ("edd_today", "EDD today", 0, 0),
+    ("overdue", "Overdue", None, -1),
+]
+
+
+def get_edd_bucket(days_remaining):
+    if days_remaining is None:
+        return None, None
+    for key, label, lo, hi in EDD_BUCKETS:
+        if (lo is None or days_remaining >= lo) and (hi is None or days_remaining <= hi):
+            return key, label
+    return None, None
+
+
+def get_edd_info(pw) -> dict:
+    """Tracking EDD (pw.edd_date) ke against days remaining + bucket."""
+    def _d(v):
+        return v.date() if isinstance(v, datetime) else v
+
+    tracking_edd = _d(pw.edd_date)
+    days_remaining = (tracking_edd - date.today()).days if tracking_edd else None
+    key, label = get_edd_bucket(days_remaining)
+
+    # delivered / inactive woman ka bucket nahi
+    if not pw.is_active or pw.pregnancy_outcome not in (None, "referred"):
+        key, label = "delivered", "Delivered"
+
+    return {
+        "lmp_edd_date": _d(getattr(pw, "lmp_edd_date", None)),
+        "usg_edd_date": _d(getattr(pw, "usg_edd_date", None)),
+        "tracking_edd": tracking_edd,
+        "edd_source": "USG" if getattr(pw, "usg_edd_date", None) else "LMP",
+        "days_remaining": days_remaining,
+        "edd_bucket": key,
+        "edd_bucket_label": label,
+    } 
+
+
+
+# Scheduler ke EDD_CASE_TYPES jaisa hi (dono jagah same rakhna)
+
+
+# Scheduler ke EDD_CASE_TYPES jaisa hi (dono jagah same rakhna)
+EDD_ACTION_TYPES = [
+    "near_edd",
+    "hrp_near_edd",
+    "hrp_near_edd_not_mobilised",
+    "edd_today_not_admitted",
+    "edd_overdue_no_delivery",
+]
+# mobilisation_routes.DELIVERY_TRIGGERS jaisa hi (stage workflow wale cases)
+DELIVERY_STAGE_TRIGGERS = EDD_ACTION_TYPES + ["hrp_unreferred"]
+
+
+def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
+    """Delivery record hone par delivery-related open cases band. Commit caller karega."""
+    from models import MobilisationCase
+
+    cases = db.query(MobilisationCase).filter(
+        MobilisationCase.pregnant_woman_id == pregnant_woman_id,
+        MobilisationCase.trigger_type.in_(trigger_types or DELIVERY_STAGE_TRIGGERS),
+        MobilisationCase.status.in_(["pending", "escalated", "mobilised"]),
+    ).all()
+    for c in cases:
+        c.status = "closed"
+
+
+def close_cases_on_admission(db, pregnant_woman_id, user_id, dp_id, admitted_at=None):
+    """
+    Admission record hote hi woman ki saari open mobilisation entries band.
+    Delivery-related cases ka stage 'admitted' ho jaata hai aur history me row jaati hai.
+    Commit caller karega.
+    """
+    from models import MobilisationCase, MobilisationAction
+
+    now = datetime.now()
+    when = admitted_at or now
+    cases = db.query(MobilisationCase).filter(
+        MobilisationCase.pregnant_woman_id == pregnant_woman_id,
+        MobilisationCase.status.in_(["pending", "escalated", "mobilised"]),
+    ).all()
+    for c in cases:
+        if c.trigger_type in DELIVERY_STAGE_TRIGGERS:
+            c.mobilisation_stage = "admitted"
+            c.current_location = "at_dp"
+            c.selected_dp_id = dp_id
+            c.stage_updated_at = now
+            db.add(MobilisationAction(
+                case_id=c.id,
+                action_datetime=when,
+                mobilisation_stage="admitted",
+                current_location="at_dp",
+                selected_dp_id=dp_id,
+                recorded_by=user_id,
+            ))
+        c.status = "closed"
+
+    # Required entry done -> close the alerts of these cases (spec M). Commit stays with the caller.
+    from services.alert_rules import close_case_alerts
+    close_case_alerts(db, [c.id for c in cases], note="Admission recorded", commit=False)
+
+
+def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
+    """Required entry record hote hi open EDD cases band. Commit caller karega."""
+    from models import MobilisationCase
+
+    cases = db.query(MobilisationCase).filter(
+        MobilisationCase.pregnant_woman_id == pregnant_woman_id,
+        MobilisationCase.trigger_type.in_(trigger_types or EDD_ACTION_TYPES),
+        MobilisationCase.status.in_(["pending", "escalated"]),
+    ).all()
+    for c in cases:
+        c.status = "closed"
+
+    # Required entry done -> close the alerts of these cases (spec M). Commit stays with the caller.
+    from services.alert_rules import close_case_alerts
+    close_case_alerts(db, [c.id for c in cases], note="Required entry recorded", commit=False)

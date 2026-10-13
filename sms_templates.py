@@ -64,6 +64,14 @@ SMS_TEMPLATES = {
     "grievance_acknowledgement": {
         "message": "ନିରୀକ୍ଷଣ-ପୁରୀ, ଆପଣଙ୍କ ଅଭିଯୋଗ ଆମେ ଗ୍ରହଣ କରିଛୁ। ସମ୍ପୃକ୍ତ ଅଧିକାରୀ ଶୀଘ୍ର ଏହାର ଯାଞ୍ଚ କରିବେ। ଧନ୍ୟବାଦ। NHM PURI",
         "variables": []
+    },
+
+    # NOTE: wording must be approved on the DLT portal and its ID added to
+    # SMS_TEMPLATE_IDS below (or set SMS_DP_REFERRAL_TEMPLATE_ID in .env).
+    # Until then the SMS is skipped (see services/alert_sms.py).
+    "dp_referral": {
+        "message": "ନିରୀକ୍ଷଣ-ପୁରୀ, ପ୍ରସବ ପାଇଁ ଆପଣଙ୍କୁ {DP} କୁ ରେଫର କରାଯାଇଛି। ଦୟାକରି ଶୀଘ୍ର ସେଠାରେ ପହଞ୍ଚନ୍ତୁ। NHM PURI",
+        "variables": ["DP"]
     }
 }
 
@@ -87,7 +95,13 @@ SMS_TEMPLATE_IDS = {
     "high_risk_alert":          "1707177651452839127",
     "usg_booking_confirmation": "1707177651444011215",
     "grievance_acknowledgement": "1707177651458920956",
+    # "dp_referral": "<DLT template id after approval>",
 }
+
+# DP referral DLT id can also come from the environment
+import os as _os
+if _os.getenv("SMS_DP_REFERRAL_TEMPLATE_ID"):
+    SMS_TEMPLATE_IDS["dp_referral"] = _os.getenv("SMS_DP_REFERRAL_TEMPLATE_ID")
 
 
 def get_sms_template(template_name: str, **kwargs) -> dict:

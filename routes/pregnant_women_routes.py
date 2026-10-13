@@ -33,6 +33,9 @@ from bulk_upload_service import (
     summarize as summarize_results, serialize_rows, UPDATE_MODES
 )
 from services.notification_service import NotificationService
+from services.alert_rules import raise_alert
+from services.hrp_service import add_conditions, recompute_status, sync_flag_condition
+from services.tracking_service import get_edd_info
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -231,6 +234,7 @@ async def register_pregnant_woman(
     
     # Aadhaar data is currently disabled; keep any provided values out of storage
     data_dict = pw_data.dict()
+    mcp_conditions = data_dict.pop("mcp_card_conditions", None) or []
     # if data_dict.get('aadhaar_number'):
     #     raw_aadhaar = data_dict['aadhaar_number']
     #     data_dict['aadhaar_number'] = hash_aadhaar(raw_aadhaar)
@@ -270,7 +274,13 @@ async def register_pregnant_woman(
     db.add(new_pw)
     db.commit()
     db.refresh(new_pw)
-
+    # LMP-based EDD: auto calculate, kept permanently
+    if new_pw.lmp_date:
+        from datetime import timedelta
+        new_pw.lmp_edd_date = new_pw.lmp_date + timedelta(days=280)
+        if not new_pw.edd_date:
+            new_pw.edd_date = new_pw.lmp_edd_date
+        db.commit()
     # Append EDD history if EDD was set at registration
     if new_pw.edd_date:
         from models import EDDHistory
@@ -282,7 +292,32 @@ async def register_pregnant_woman(
             changed_by=current_user.id,
         ))
         db.commit()
-
+        # HRP tagging at registration (spec D): MCP card, difficult area, migrant worker
+    _hrp_new = False
+    _r = add_conditions(db, new_pw, mcp_conditions, "mcp_card", user_id=current_user.id, reference_type="registration")
+    _hrp_new = _hrp_new or bool(_r["created"])
+    if new_pw.is_difficult_area:
+        _r = add_conditions(db, new_pw, ["Difficult geographical area"], "difficult_area", user_id=current_user.id, reference_type="registration")
+        _hrp_new = _hrp_new or bool(_r["created"])
+    if new_pw.is_migrant_worker:
+        _r = add_conditions(db, new_pw, ["Migrant worker"], "migrant_worker", user_id=current_user.id, reference_type="registration")
+        _hrp_new = _hrp_new or bool(_r["created"])
+    if new_pw.is_high_risk and not _hrp_new:
+        # user ne sirf "High Risk" tick kiya, koi condition select nahi ki
+        _r = add_conditions(db, new_pw, ["Marked high risk at registration"], "manual", user_id=current_user.id, reference_type="registration")
+        _hrp_new = bool(_r["created"])
+    db.commit()
+    if _hrp_new:
+        raise_alert(
+            db, "hrp_identified", new_pw,
+            title="⚠️ High-Risk Case Identified",
+            message=f"{new_pw.full_name} has been tagged high-risk at registration.",
+            alert_key=f"hrp_identified:{new_pw.id}",
+            reference_id=new_pw.id,
+            reference_type="pregnant_woman",
+            action_url=f"/pregnant-women/{new_pw.id}",
+            metadata={"pregnant_woman_name": new_pw.full_name, "risk_factors": new_pw.risk_factors},
+        )
     ip_address, user_agent = get_client_info(request)
     log_create(
         db,
@@ -413,12 +448,16 @@ async def get_pregnant_women(
         sub_centre_id=pw.sub_centre_id,
         lmp_date=pw.lmp_date,
         edd_date=pw.edd_date,
+        **{k: v for k, v in get_edd_info(pw).items() if k != "tracking_edd"},
         gravida=pw.gravida,
         para=pw.para,
         hpr_id=pw.hpr_id,
         blood_group=pw.blood_group,
         is_high_risk=pw.is_high_risk,
         risk_factors=pw.risk_factors,
+        hrp_status=pw.hrp_status,
+        is_difficult_area=bool(pw.is_difficult_area),
+        is_migrant_worker=bool(pw.is_migrant_worker),
         is_self_registered=pw.is_self_registered,
         registration_approved=pw.registration_approved,
         is_active=pw.is_active,
@@ -511,6 +550,9 @@ async def get_pending_approvals(
         blood_group=pw.blood_group,
         is_high_risk=pw.is_high_risk,
         risk_factors=pw.risk_factors,
+        hrp_status=pw.hrp_status,
+        is_difficult_area=bool(pw.is_difficult_area),
+        is_migrant_worker=bool(pw.is_migrant_worker),
         is_self_registered=pw.is_self_registered,
         registration_approved=pw.registration_approved,
         is_active=pw.is_active,
@@ -538,7 +580,48 @@ async def get_pregnant_woman(
         )
     
     return pw
+@router.get("/{pw_id}/edd-info")
+async def get_pw_edd_info(
+    pw_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """EDD summary (LMP EDD, USG EDD, Tracking EDD, days remaining, bucket) + change log."""
+    from models import EDDHistory
 
+    pw = db.query(PregnantWoman).filter(PregnantWoman.id == pw_id).first()
+    if not pw:
+        raise HTTPException(status_code=404, detail="Pregnant woman not found")
+
+    # role scope
+    if current_user.role == "district" and pw.district_id != current_user.district_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.role in ("block", "pmsma") and pw.block_id != current_user.block_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.role == "sub_centre" and pw.sub_centre_id != current_user.sub_centre_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    rows = (
+        db.query(EDDHistory, User.full_name)
+        .outerjoin(User, User.id == EDDHistory.changed_by)
+        .filter(EDDHistory.pregnant_woman_id == pw_id)
+        .order_by(EDDHistory.changed_at.desc(), EDDHistory.id.desc())
+        .all()
+    )
+    history = [
+        {
+            "id": h.id,
+            "previous_edd": h.previous_edd,
+            "new_edd": h.new_edd,
+            "source": h.source,
+            "changed_by": h.changed_by,
+            "changed_by_name": name,
+            "changed_at": h.changed_at,
+        }
+        for h, name in rows
+    ]
+
+    return {"pw_id": pw.id, "full_name": pw.full_name, **get_edd_info(pw), "history": history}
 @router.put("/{pw_id}", response_model=PregnantWomanResponse)
 async def update_pregnant_woman(
     pw_id: int,
@@ -570,35 +653,31 @@ async def update_pregnant_woman(
         setattr(pw, field, value)
     
     pw.updated_at = datetime.now()
-    
-    # Check if marked as high-risk and send SMS
+    # HRP tagging (spec D)
+        # HRP tagging (spec D): tick => condition add, untick => condition resolve
+    if "is_difficult_area" in update_data:
+        sync_flag_condition(db, pw, "difficult_area", "Difficult geographical area",
+                            bool(update_data["is_difficult_area"]), user_id=current_user.id)
+    if "is_migrant_worker" in update_data:
+        sync_flag_condition(db, pw, "migrant_worker", "Migrant worker",
+                            bool(update_data["is_migrant_worker"]), user_id=current_user.id)
     if pw_update.is_high_risk and not was_high_risk:
-        # Send high-risk alert notification
-        recipients = NotificationService.get_recipients_for_event(
-            db,
-            "high_risk_alert",
-            {
-                "district_id": pw.district_id,
-                "block_id": pw.block_id,
-                "sub_centre_id": pw.sub_centre_id
-            }
+        add_conditions(db, pw, [(pw_update.risk_factors or "").strip()[:150] or "Marked high risk (manual)"],
+                       "manual", user_id=current_user.id)
+    # Check if marked as high-risk and send SMS
+    if pw.is_high_risk and not was_high_risk:
+        # HRP identified -> Sub-centre + Block + District (alert matrix, spec M)
+        raise_alert(
+            db, "hrp_identified", pw,
+            title="⚠️ High-Risk Case Identified",
+            message=f"{pw.full_name} has been marked as high-risk. Immediate attention required.",
+            alert_key=f"hrp_identified:{pw.id}",
+            reference_id=pw.id,
+            reference_type="pregnant_woman",
+            action_url=f"/pregnant-women/{pw.id}",
+            metadata={"pregnant_woman_name": pw.full_name, "risk_factors": pw.risk_factors},
         )
-        
-        if recipients:
-            NotificationService.create_notification(
-                db=db,
-                user_ids=recipients,
-                title="⚠️ High-Risk Case Identified",
-                message=f"{pw.full_name} has been marked as high-risk. Immediate attention required.",
-                notification_type="high_risk_alert",
-                category="registration",
-                priority="high",
-                reference_id=pw.id,
-                reference_type="pregnant_woman",
-                action_url=f"/pregnant-women/{pw.id}",
-                metadata={"pregnant_woman_name": pw.full_name, "risk_factors": pw.risk_factors}
-            )
-        
+
         _sms = get_sms_template("high_risk_alert")
         # Use background task if available, otherwise send directly
         try:

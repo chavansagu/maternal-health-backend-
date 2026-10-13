@@ -12,9 +12,25 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+USG_HIGH_RISK_FINDINGS = [
+    "Placenta previa / low-lying placenta",
+    "Placental abruption",
+    "Oligohydramnios",
+    "Polyhydramnios",
+    "Fetal growth restriction",
+    "Abnormal Doppler",
+    "Multiple pregnancy",
+    "Malpresentation",
+    "Major congenital anomaly",
+    "Abnormal fetal heart rate",
+    "Short cervix",
+    "Fibroid or adnexal mass",
+    "Placenta accreta spectrum",
+    "Absent / reversed end-diastolic flow",
+]
 
 from database import get_db
-from models import USGAppointment, User, PregnantWoman, Notification, SMSLog
+from models import USGAppointment, User, PregnantWoman, Notification, SMSLog ,AppointmentStatus
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -55,6 +71,8 @@ from file_validator import validate_upload_file
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 
 from services.notification_service import NotificationService
+from services.alert_rules import raise_alert,close_alerts
+from services.hrp_service import add_conditions
 from services.tracking_service import get_tracking_info
 
 def format_appointment_response(appointment, db=None):
@@ -381,52 +399,22 @@ async def schedule_usg_appointment(
         None   # user_agent
     )
     
-    # Send in-app notification to USG centre
+    # USG scheduled -> USG centre + PMSMA + Sub-centre (alert matrix, spec M)
+    # (The old duplicate "USG centre" loop is removed - it notified the same users twice.)
     is_emergency = appointment_type == "emergency"
-    recipients = NotificationService.get_recipients_for_event(
-        db,
-        "appointment_emergency" if is_emergency else "appointment_scheduled",
-        {"usg_centre_id": usg_centre_id}
+    raise_alert(
+        db, "usg_scheduled", pw,
+        title="🚨 Emergency USG Appointment" if is_emergency else "New USG Appointment",
+        message=f"New {'emergency ' if is_emergency else ''}appointment scheduled for {pw.full_name} on {scheduled_date}",
+        alert_key=f"usg_scheduled:{new_appointment.id}",
+        reference_id=new_appointment.id,
+        reference_type="usg_appointment",
+        action_url=f"/usg-appointments/{new_appointment.id}",
+        context={"usg_centre_id": usg_centre_id},
+        metadata={"pregnant_woman_name": pw.full_name, "scheduled_date": str(scheduled_date), "emergency": is_emergency},
+        priority="high" if is_emergency else None,
     )
-    
-    if recipients:
-        NotificationService.create_notification(
-            db=db,
-            user_ids=recipients,
-            title="🚨 Emergency USG Appointment" if is_emergency else "New USG Appointment",
-            message=f"New {'emergency ' if is_emergency else ''}appointment scheduled for {pw.full_name} on {scheduled_date}",
-            notification_type="appointment_emergency" if is_emergency else "appointment_scheduled",
-            category="appointment",
-            priority="high" if is_emergency else "normal",
-            reference_id=new_appointment.id,
-            reference_type="usg_appointment",
-            action_url=f"/usg-appointments/{new_appointment.id}",
-            metadata={"pregnant_woman_name": pw.full_name, "scheduled_date": scheduled_date}
-        )
-    
-    # Send notification to USG centre (old method - keeping for backward compatibility)
-    from models import User as UserModel
-    usg_users = db.query(UserModel).filter(
-        UserModel.usg_centre_id == usg_centre_id,
-        UserModel.is_active == True
-    ).all()
-    
-    for usg_user in usg_users:
-        notification_title = "New USG Appointment"
-        if appointment_type == "emergency":
-            notification_title = "🚨 EMERGENCY USG Appointment"
-        
-        background_tasks.add_task(
-            create_notification,
-            user_id=usg_user.id,
-            title=notification_title,
-            message=f"New USG appointment scheduled for {pw.full_name} on {scheduled_date}",
-            notification_type="appointment",
-            reference_id=new_appointment.id,
-            reference_type="usg_appointment",
-            db=db
-        )
-    
+
     # Send SMS to pregnant woman
     if pw:
         from models import USGCentre
@@ -805,6 +793,11 @@ async def update_usg_appointment(
         "appointment": format_appointment_response(appointment, db)
     }
 
+@router.get("/high-risk-options")
+async def get_high_risk_options(current_user: User = Depends(get_current_active_user)):
+    """Fixed list of USG high-risk findings (multi-select)."""
+    return USG_HIGH_RISK_FINDINGS
+
 @router.get("/{appointment_id}", response_model=dict)
 async def get_appointment(
     appointment_id: int,
@@ -873,6 +866,7 @@ async def accept_appointment(
     appointment.accepted_by = current_user.id
     db.commit()
     db.refresh(appointment)
+    close_alerts(db, f"usg_scheduled:{appointment.id}", note="USG appointment accepted")
     
     # Send in-app notification to scheduler
     if appointment.scheduled_by and pw:
@@ -984,7 +978,7 @@ async def reschedule_appointment(
     appointment.accepted_by = current_user.id
     db.commit()
     db.refresh(appointment)
-
+    close_alerts(db, f"usg_scheduled:{appointment.id}", note="USG appointment rescheduled by centre")
     # Send in-app notification to scheduler
     if appointment.scheduled_by and pw:
         NotificationService.create_notification(
@@ -1090,22 +1084,52 @@ async def complete_appointment(
     # Fetch pregnant woman details
     pw = db.query(PregnantWoman).filter(PregnantWoman.id == appointment.pregnant_woman_id).first()
 
-    # Validate confirmed_edd_date — required for USG completion
-    confirmed_edd = form.get("confirmed_edd_date") or None
-    if not confirmed_edd:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="confirmed_edd_date is required when completing a USG appointment"
-        )
-    from datetime import date as date_type
-    try:
-        confirmed_edd_parsed = date_type.fromisoformat(str(confirmed_edd))
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="confirmed_edd_date must be in YYYY-MM-DD format"
-        )
+       # ── Validation ──
+    import json as _json
+    errors = []
+    if not scan_date.strip():
+        errors.append("USG date is required")
+    if not doctor_name.strip():
+        errors.append("Doctor name is required")
+    if not findings.strip():
+        errors.append("Findings are required")
 
+    try:
+        selected_hr = _json.loads(abnormal_findings) if abnormal_findings else []
+    except ValueError:
+        selected_hr = []
+    if not isinstance(selected_hr, list):
+        selected_hr = []
+    invalid = [x for x in selected_hr if x not in USG_HIGH_RISK_FINDINGS]
+    if invalid:
+        errors.append(f"Invalid high-risk finding: {', '.join(invalid)}")
+    flag_hrp = bool(selected_hr) or is_high_risk
+
+    # USG EDD is mandatory only at the woman's first completed scan
+    prior_completed = db.query(USGAppointment).filter(
+        USGAppointment.pregnant_woman_id == appointment.pregnant_woman_id,
+        USGAppointment.status == AppointmentStatus.COMPLETED,
+        USGAppointment.id != appointment.id,
+    ).count()
+    is_first_scan = prior_completed == 0
+
+    confirmed_edd = form.get("confirmed_edd_date") or None
+    if is_first_scan and not confirmed_edd:
+        errors.append("USG EDD is required at the first scan")
+
+    if errors:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="; ".join(errors))
+
+    confirmed_edd_parsed = None
+    if confirmed_edd:
+        from datetime import date as date_type
+        try:
+            confirmed_edd_parsed = date_type.fromisoformat(str(confirmed_edd))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="confirmed_edd_date must be in YYYY-MM-DD format"
+            )
     # Validate at least one report file provided
     import json
     valid_report_files = [f for f in report_files if f and f.filename]
@@ -1129,30 +1153,53 @@ async def complete_appointment(
     appointment.trimester = trimester
     appointment.scan_type = scan_type
     appointment.findings = findings
-    appointment.abnormal_findings = abnormal_findings
+    appointment.abnormal_findings = _json.dumps(selected_hr) if selected_hr else None
     appointment.additional_notes = additional_notes
     appointment.doctor_name = doctor_name
     appointment.technician_name = technician_name
     appointment.usg_findings = usg_findings
-    appointment.is_high_risk = is_high_risk or findings == "Abnormal"
+    appointment.is_high_risk = flag_hrp or findings == "Abnormal"
     appointment.report_file_path = report_paths[0] if report_paths else None
     appointment.report_file_paths = json.dumps(report_paths) if report_paths else None
     appointment.completed_by = current_user.id
 
     # Write USG-confirmed EDD to PregnantWoman and append to EDD history
-    from models import EDDHistory
-    db.add(EDDHistory(
-        pregnant_woman_id=pw.id,
-        previous_edd=pw.edd_date,
-        new_edd=confirmed_edd_parsed,
-        source="USG_CONFIRMED",
-        changed_by=current_user.id,
-    ))
-    pw.edd_date = confirmed_edd_parsed
+    if confirmed_edd_parsed and pw.usg_edd_date is None:
+        from models import EDDHistory
+        db.add(EDDHistory(
+            pregnant_woman_id=pw.id,
+            previous_edd=pw.edd_date,
+            new_edd=confirmed_edd_parsed,
+            source="USG_CONFIRMED",
+            changed_by=current_user.id,
+        ))
+        pw.usg_edd_date = confirmed_edd_parsed
+        pw.edd_date = confirmed_edd_parsed
 
     db.commit()
     db.refresh(appointment)
-    
+    close_alerts(db, f"usg_scheduled:{appointment.id}", note="USG completed")
+        # Automatic HRP update + notification to ANM, Block and District
+    if pw and flag_hrp:
+        labels = selected_hr or ["USG high-risk finding"]
+        _res = add_conditions(
+            db, pw, labels, "usg", user_id=current_user.id,
+            reference_type="usg_appointment", reference_id=appointment.id,
+        )
+        newly_flagged = _res["newly_flagged"]
+        db.commit()
+
+        # USG high-risk finding -> Sub-centre + Block + District (alert matrix, spec M)
+        raise_alert(
+            db, "usg_high_risk_finding", pw,
+            title="⚠️ High-Risk Case — USG",
+            message=f"{pw.full_name}: high-risk finding at USG — {', '.join(labels)}.",
+            alert_key=f"usg_high_risk_finding:{appointment.id}",
+            reference_id=pw.id,
+            reference_type="pregnant_woman",
+            action_url=f"/pregnant-women/{pw.id}",
+            metadata={"pregnant_woman_name": pw.full_name, "findings": labels, "newly_flagged": newly_flagged},
+        )
     # Send in-app notification to scheduler
     if appointment.scheduled_by and pw:
         NotificationService.create_notification(
@@ -1265,7 +1312,7 @@ async def cancel_appointment(
     appointment.updated_at = datetime.now()
     
     db.commit()
-    
+    close_alerts(db, f"usg_scheduled:{appointment.id}", note="USG appointment cancelled")
     # Send in-app notifications
     recipients = []
     if appointment.scheduled_by:

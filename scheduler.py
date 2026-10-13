@@ -56,7 +56,7 @@ def check_reschedule_window(
             status_code=400,
             detail=(
                 "Rescheduling must be within 7 days of original date. "
-                "To override, set is_emergency_override=true and provide override_reason."
+                # "To override, set is_emergency_override=true and provide override_reason."
             )
         )
     if not override_reason or not override_reason.strip():
@@ -272,7 +272,9 @@ def job_feedback_call_2():
         logger.error(f"[Scheduler] Feedback Call 2 FAILED — {str(e)}")
 
 
-def _upsert_mobilisation_case(db, pw, trigger_type, detail, reference_id=None):
+def _upsert_mobilisation_case(db, pw, trigger_type, detail, reference_id=None,
+                              priority=None, pending_action=None,
+                              responsible_role="sub_centre"):
     """
     Create a mobilisation case if there isn't already an OPEN one
     (pending/escalated) for this woman + trigger type.
@@ -288,21 +290,44 @@ def _upsert_mobilisation_case(db, pw, trigger_type, detail, reference_id=None):
     if existing:
         # Refresh the detail text (e.g. "EDD in 12 days" -> "EDD in 9 days")
         existing.trigger_detail = detail
-        return
+        if priority:
+            existing.priority = priority
+        if pending_action:
+            existing.pending_action = pending_action
+        return None
 
-    db.add(MobilisationCase(
+    new_case = MobilisationCase(
         pregnant_woman_id=pw.id,
         trigger_type=trigger_type,
         trigger_reference_id=reference_id,
         trigger_detail=detail,
+        priority=priority or "normal",
+        pending_action=pending_action or detail,
+        responsible_role=responsible_role,
         sub_centre_id=pw.sub_centre_id,
         block_id=pw.block_id,
         district_id=pw.district_id,
         status="pending",
         escalation_level="anm",
-    ))
-
-
+    )
+    db.add(new_case)
+    db.flush()   # id mil jaaye
+        # Mobilisation pending -> Sub-centre + Block (alert matrix, spec M)
+    # EDD cases ka alert _notify_edd_case() alag se bhejta hai, isliye yahan skip.
+    if trigger_type not in EDD_CASE_TYPES:
+        from services.alert_rules import raise_alert
+        db.commit()  # case save ho jaye, taaki raise_alert ka rollback ise na hataye
+        raise_alert(
+            db, "mobilisation_pending", pw,
+            title="Mobilisation pending",
+            message=f"{pw.full_name}: {detail}. Action: {new_case.pending_action}",
+            alert_key=f"mobcase:{new_case.id}",
+            reference_id=new_case.id,
+            reference_type="MobilisationCase",
+            action_url="/mobilisation-management",
+            metadata={"pregnant_woman_name": pw.full_name, "trigger_type": trigger_type},
+        )
+    return new_case
 def _auto_close_resolved_mobilisation_cases(db):
     """
     Close open cases whose underlying trigger no longer applies
@@ -360,6 +385,11 @@ def _auto_close_resolved_mobilisation_cases(db):
                 if referred:
                     case.status = "closed"
 
+    # Alert closure on completion of the required entry (spec M)
+    from services.alert_rules import close_case_alerts
+    close_case_alerts(db, [c.id for c in open_cases if c.status == "closed"],
+                      note="Mobilisation case no longer applies", commit=False)
+
 
 def job_generate_mobilisation_cases():
     """
@@ -383,13 +413,13 @@ def job_generate_mobilisation_cases():
             ).all()
 
             # 1) Near-EDD — within 15 days
-            near_edd_cutoff = today + timedelta(days=15)
-            for pw in active_pws:
-                if pw.edd_date and today <= pw.edd_date <= near_edd_cutoff:
-                    days_left = (pw.edd_date - today).days
-                    _upsert_mobilisation_case(
-                        db, pw, "near_edd", f"EDD in {days_left} day(s)"
-                    )
+            # near_edd_cutoff = today + timedelta(days=15)
+            # for pw in active_pws:
+            #     if pw.edd_date and today <= pw.edd_date <= near_edd_cutoff:
+            #         days_left = (pw.edd_date - today).days
+            #         _upsert_mobilisation_case(
+            #             db, pw, "near_edd", f"EDD in {days_left} day(s)"
+            #         )
 
             # 2) Missed ANC — next_visit_date passed with no later visit recorded
             overdue_anc_visits = db.query(ANCVisit).filter(
@@ -458,7 +488,8 @@ def job_generate_mobilisation_cases():
                 ).first()
                 if not has_referral:
                     _upsert_mobilisation_case(
-                        db, pw, "hrp_unreferred", "High-risk case not yet referred to a delivery point"
+                        db, pw, "hrp_unreferred", "High-risk case not yet referred to a delivery point",
+                        priority="high",
                     )
 
             # 6) Close cases whose trigger has resolved itself
@@ -470,7 +501,170 @@ def job_generate_mobilisation_cases():
             db.close()
     except Exception as e:
         logger.error(f"[Scheduler] Mobilisation case generation FAILED — {str(e)}")
+# Mobilisation EDD case type -> alert matrix event (services/alert_rules.py)
+EDD_TRIGGER_TO_EVENT = {
+    "near_edd": "edd_approaching",
+    "hrp_near_edd": "hrp_near_edd",
+    "hrp_near_edd_not_mobilised": "hrp_near_edd",
+    "edd_today_not_admitted": "edd_today_not_admitted",
+    "edd_overdue_no_delivery": "edd_crossed_no_delivery",
+}
 
+EDD_ALERT_TITLES = {
+    "near_edd": "Near EDD reminder",
+    "hrp_near_edd": "HRP near EDD alert",
+    "hrp_near_edd_not_mobilised": "RED FLAG: immediate mobilisation required",
+    "edd_today_not_admitted": "RED FLAG: EDD today, not admitted",
+    "edd_overdue_no_delivery": "CRITICAL: EDD crossed, no delivery recorded",
+}
+
+
+def _notify_edd_case(db, pw, case):
+    """Naye EDD case par alert matrix ke hisaab se alert (recipients matrix decide karta hai)."""
+    from services.alert_rules import raise_alert
+
+    event_type = EDD_TRIGGER_TO_EVENT.get(case.trigger_type)
+    if not event_type:
+        return
+
+    raise_alert(
+        db, event_type, pw,
+        title=EDD_ALERT_TITLES.get(case.trigger_type, "EDD alert"),
+        message=f"{pw.full_name}: {case.trigger_detail}. Action: {case.pending_action}",
+        alert_key=f"mobcase:{case.id}",
+        reference_id=case.id,
+        reference_type="MobilisationCase",
+        action_url="/mobilisation-management",
+        metadata={"pregnant_woman_name": pw.full_name, "trigger_type": case.trigger_type},
+    )
+
+EDD_CASE_TYPES = [
+    "near_edd",
+    "hrp_near_edd",
+    "hrp_near_edd_not_mobilised",
+    "edd_today_not_admitted",
+    "edd_overdue_no_delivery",
+]
+
+
+def job_generate_edd_action_cases():
+    """
+    Job: EDD-based action engine. Har active woman ke liye sirf ek sabse
+    serious EDD case rakhta hai (priority logic):
+      EDD crossed + no delivery        -> critical
+      EDD today + not admitted         -> red_flag
+      HRP + near EDD + ANC + not mobilised -> red_flag
+      HRP + near EDD                   -> high
+      Near EDD                         -> normal
+    "Near EDD" = 1 to 15 days remaining. Runs daily.
+    """
+    logger.info(f"[Scheduler] EDD action engine started at {datetime.now()}")
+    try:
+        from database import SessionLocal
+        from models import PregnantWoman, ANCVisit, Admission, MobilisationCase
+
+        db = SessionLocal()
+        today = datetime.now().date()
+        try:
+            pws = db.query(PregnantWoman).filter(
+                PregnantWoman.is_active == True,
+                PregnantWoman.pregnancy_outcome.is_(None),
+                PregnantWoman.edd_date.isnot(None),
+            ).all()
+
+            for pw in pws:
+                days = (pw.edd_date - today).days
+                trigger = None  # (type, priority, detail, pending_action)
+
+                if days < 0:
+                    trigger = (
+                        "edd_overdue_no_delivery", "critical",
+                        f"EDD crossed {abs(days)} day(s) ago - no delivery recorded",
+                        "Locate the woman and record delivery / admission",
+                    )
+                elif days == 0:
+                    admitted = db.query(Admission.id).filter(
+                        Admission.pregnant_woman_id == pw.id
+                    ).first()
+                    if not admitted:
+                        trigger = (
+                            "edd_today_not_admitted", "red_flag",
+                            "EDD is today - woman not admitted",
+                            "Admit to delivery point immediately",
+                        )
+                elif days <= 15:
+                    if pw.is_high_risk:
+                        at_anc = db.query(ANCVisit.id).filter(
+                            ANCVisit.pregnant_woman_id == pw.id
+                        ).first()
+                        mobilised = db.query(MobilisationCase.id).filter(
+                            MobilisationCase.pregnant_woman_id == pw.id,
+                            MobilisationCase.status == "mobilised",
+                        ).first()
+                        if at_anc and not mobilised:
+                            trigger = (
+                                "hrp_near_edd_not_mobilised", "red_flag",
+                                f"HRP - EDD in {days} day(s), at ANC, not mobilised",
+                                "Immediate mobilisation required",
+                            )
+                        else:
+                            trigger = (
+                                "hrp_near_edd", "high",
+                                f"HRP - EDD in {days} day(s)",
+                                "Confirm delivery plan and facility for high-risk woman",
+                            )
+                    else:
+                        trigger = (
+                            "near_edd", "normal",
+                            f"EDD in {days} day(s)",
+                            "Remind woman and confirm delivery plan",
+                        )
+
+                keep_type = trigger[0] if trigger else None
+
+                # Is woman ke baaki open EDD cases band (severity badli ya condition khatam)
+                stale = db.query(MobilisationCase).filter(
+                    MobilisationCase.pregnant_woman_id == pw.id,
+                    MobilisationCase.trigger_type.in_(EDD_CASE_TYPES),
+                    MobilisationCase.status.in_(["pending", "escalated"]),
+                    MobilisationCase.trigger_type != (keep_type or ""),
+                ).all()
+                for c in stale:
+                    c.status = "closed"
+                if stale:
+                    from services.alert_rules import close_case_alerts
+                    close_case_alerts(db, [c.id for c in stale],
+                                      note="EDD situation changed", commit=False)
+
+                if not trigger:
+                    continue
+
+                t_type, t_priority, t_detail, t_action = trigger
+
+                # Normal/high cases: agar ANM mobilise kar chuki hai to roz dobara na banao
+                if t_priority in ("normal", "high"):
+                    done = db.query(MobilisationCase.id).filter(
+                        MobilisationCase.pregnant_woman_id == pw.id,
+                        MobilisationCase.trigger_type == t_type,
+                        MobilisationCase.status == "mobilised",
+                    ).first()
+                    if done:
+                        continue
+
+                new_case = _upsert_mobilisation_case(
+                    db, pw, t_type, t_detail,
+                    priority=t_priority, pending_action=t_action,
+                    responsible_role="sub_centre",
+                )
+                if new_case:
+                    _notify_edd_case(db, pw, new_case)
+
+            db.commit()
+            logger.info("[Scheduler] EDD action engine DONE")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Scheduler] EDD action engine FAILED — {str(e)}")
 
 def job_escalate_mobilisation_cases():
     """
@@ -509,6 +703,16 @@ def job_escalate_mobilisation_cases():
                 case.escalated_at = datetime.now()
 
             db.commit()
+
+            # Keep the notification / escalation_logs side in step with the case chain (spec M)
+            from services.alert_rules import escalate_alert
+            for case in to_block:
+                escalate_alert(db, f"mobcase:{case.id}", "block",
+                               note="Mobilisation case pending > 3 days")
+            for case in to_district:
+                escalate_alert(db, f"mobcase:{case.id}", "district",
+                               note="Mobilisation case pending > 6 days")
+
             logger.info(
                 f"[Scheduler] Mobilisation escalation DONE — "
                 f"to_block={len(to_block)}, to_district={len(to_district)}"
@@ -549,6 +753,248 @@ def job_surface_pnc_reminders():
             db.close()
     except Exception as e:
         logger.error(f"[Scheduler] PNC reminder surfacing FAILED — {str(e)}")
+
+ANC_DUE_WINDOW_DAYS = 2     # next ANC date within 2 days = "due"
+PMSMA_DUE_WINDOW_DAYS = 2   # PMSMA session within 2 days = "due"
+
+
+def job_generate_anc_pmsma_alerts():
+    """
+    Job: ANC / PMSMA time-based alerts (alert matrix, spec M). Runs daily.
+      Below 28 weeks (regular ANC, last visit's next_visit_date):
+          due within 2 days   -> anc_due        (Sub-centre)
+          date passed         -> anc_overdue    (Sub-centre + Block)
+      28 weeks and above (weekly visits, tracking_service.get_weekly_visit_status):
+          due soon            -> anc_visit_due     (Sub-centre)
+          overdue             -> anc_visit_missed  (Sub-centre; Block comes via escalation)
+      PMSMA session (scheduled / rescheduled) within 2 days -> pmsma_due (Sub-centre + PMSMA)
+    raise_alert() skips users who already have the same alert open (alert_key),
+    so the same alert is not repeated every day.
+    """
+    logger.info(f"[Scheduler] ANC/PMSMA alerts started at {datetime.now()}")
+    try:
+        from database import SessionLocal
+        from models import PregnantWoman, ANCVisit, PMSMASession
+        from services.alert_rules import raise_alert
+        from services.tracking_service import get_gestational_weeks, get_weekly_visit_status, ENHANCED_FROM_WEEK
+
+        db = SessionLocal()
+        today = datetime.now().date()
+        counts = {}
+        try:
+            pws = db.query(PregnantWoman).filter(
+                PregnantWoman.is_active == True,
+                PregnantWoman.pregnancy_outcome.is_(None),
+            ).all()
+            pw_map = {pw.id: pw for pw in pws}
+
+            # Latest ANC visit of each woman (single query)
+            last_visit = {}
+            for v in db.query(ANCVisit).order_by(ANCVisit.visit_date.asc(), ANCVisit.visit_number.asc()).all():
+                if v.pregnant_woman_id in pw_map:
+                    last_visit[v.pregnant_woman_id] = v
+
+            for pw in pws:
+                visit = last_visit.get(pw.id)
+                event = title = msg = None
+
+                weeks = get_gestational_weeks(pw, today)
+                if weeks is not None and weeks >= ENHANCED_FROM_WEEK:
+                    # 28+ weeks: weekly visits
+                    weekly = get_weekly_visit_status(pw, visit.visit_date if visit else None, today)
+                    due = weekly["next_due_visit"]
+                    if weekly["anc_status"] == "overdue":
+                        event, title = "anc_visit_missed", "Weekly ANC visit missed"
+                        msg = f"{pw.full_name}: weekly ANC visit was due on {due:%d/%m/%Y} ({weekly['days_overdue']} day(s) overdue)."
+                    elif weekly["anc_status"] == "due_soon":
+                        event, title = "anc_visit_due", "Weekly ANC visit due"
+                        msg = f"{pw.full_name}: weekly ANC visit is due on {due:%d/%m/%Y}."
+                elif visit and visit.next_visit_date:
+                    # Below 28 weeks: regular ANC
+                    days_left = (visit.next_visit_date - today).days
+                    if days_left < 0:
+                        event, title = "anc_overdue", "ANC visit overdue"
+                        msg = f"{pw.full_name}: ANC visit was due on {visit.next_visit_date:%d/%m/%Y} ({abs(days_left)} day(s) overdue)."
+                    elif days_left <= ANC_DUE_WINDOW_DAYS:
+                        event, title = "anc_due", "ANC visit due"
+                        msg = f"{pw.full_name}: ANC visit is due on {visit.next_visit_date:%d/%m/%Y}."
+
+                if not event:
+                    continue
+                created = raise_alert(
+                    db, event, pw,
+                    title=title, message=msg,
+                    alert_key=f"{event}:{pw.id}",
+                    reference_id=pw.id,
+                    reference_type="pregnant_woman",
+                    action_url=f"/pregnant-women/{pw.id}",
+                    metadata={"pregnant_woman_name": pw.full_name},
+                )
+                counts[event] = counts.get(event, 0) + (1 if created else 0)
+
+                # ANC due -> SMS to the beneficiary too (only the first time the alert is raised)
+                if event == "anc_due" and created and visit and visit.next_visit_date:
+                    from services.alert_sms import send_template_sms_sync
+                    send_template_sms_sync(
+                        "anc_reminder", pw.mobile_number, pw.id,
+                        DATE=visit.next_visit_date.strftime("%d/%m/%Y"),
+                    )
+
+            # PMSMA due: scheduled / rescheduled session in the next 2 days
+            start = datetime.combine(today, datetime.min.time())
+            end = datetime.combine(today + timedelta(days=PMSMA_DUE_WINDOW_DAYS), datetime.max.time())
+            sessions = db.query(PMSMASession).filter(
+                PMSMASession.status.in_(["scheduled", "rescheduled"]),
+                PMSMASession.scheduled_date >= start,
+                PMSMASession.scheduled_date <= end,
+            ).all()
+            for s in sessions:
+                pw = pw_map.get(s.pregnant_woman_id)
+                if not pw:
+                    continue
+                created = raise_alert(
+                    db, "pmsma_due", pw,
+                    title="PMSMA session due",
+                    message=f"{pw.full_name}: PMSMA session on {s.scheduled_date:%d/%m/%Y %I:%M %p}.",
+                    alert_key=f"pmsma_due:{s.id}",
+                    reference_id=s.id,
+                    reference_type="pmsma_session",
+                    action_url="/pmsma-sessions",
+                    metadata={"pregnant_woman_name": pw.full_name},
+                )
+                counts["pmsma_due"] = counts.get("pmsma_due", 0) + (1 if created else 0)
+
+            logger.info(f"[Scheduler] ANC/PMSMA alerts DONE — {counts}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Scheduler] ANC/PMSMA alerts FAILED — {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification & Escalation module (spec M) — extra jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+REFERRAL_PENDING_AFTER_HOURS = int(os.getenv("REFERRAL_PENDING_AFTER_HOURS", "2"))
+_ANC_ALERT_TYPES = ("anc_due", "anc_overdue", "anc_visit_due", "anc_visit_missed")
+
+
+def job_referral_pending_alerts():
+    """
+    Job: referral still 'pending' (not accepted by the DP) after REFERRAL_PENDING_AFTER_HOURS
+    -> referral_pending alert to concerned DP + Block + District (alert matrix, spec M).
+    Also closes referral_pending alerts whose referral is no longer pending.
+    Runs every 30 minutes; raise_alert() dedupes via alert_key so nothing repeats.
+    """
+    logger.info(f"[Scheduler] Referral pending alerts started at {datetime.now()}")
+    try:
+        from database import SessionLocal
+        from models import DeliveryReferral, DeliveryPoint, PregnantWoman, Notification
+        from services.alert_rules import raise_alert, close_alerts
+
+        db = SessionLocal()
+        try:
+            cutoff = datetime.now() - timedelta(hours=REFERRAL_PENDING_AFTER_HOURS)
+            raised = closed = 0
+
+            pending = db.query(DeliveryReferral).filter(
+                DeliveryReferral.status == "pending",
+                DeliveryReferral.created_at <= cutoff,
+            ).all()
+            for r in pending:
+                pw = db.query(PregnantWoman).filter(PregnantWoman.id == r.pregnant_woman_id).first()
+                dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == r.dp_id).first()
+                if not pw:
+                    continue
+                created = raise_alert(
+                    db, "referral_pending", pw,
+                    title="Referral pending",
+                    message=(f"{pw.full_name}: referral to {dp.name if dp else 'the Delivery Point'} "
+                             f"is still pending since {r.created_at:%d/%m/%Y %I:%M %p}."),
+                    alert_key=f"referral_pending:{r.id}",
+                    reference_id=r.id,
+                    reference_type="delivery_referral",
+                    action_url=f"/delivery-referrals/{r.id}",
+                    context={"dp_id": r.dp_id,
+                             "block_id": dp.block_id if dp else None,
+                             "district_id": dp.district_id if dp else None},
+                    metadata={"pregnant_woman_name": pw.full_name},
+                )
+                raised += 1 if created else 0
+
+            # closure sweep: referral accepted / re-referred / completed meanwhile
+            open_keys = db.query(Notification.alert_key).filter(
+                Notification.notification_type == "referral_pending",
+                Notification.is_resolved == False,
+            ).distinct().all()
+            for (key,) in open_keys:
+                try:
+                    rid = int(key.split(":")[1])
+                except Exception:
+                    continue
+                r = db.query(DeliveryReferral).filter(DeliveryReferral.id == rid).first()
+                if not r or r.status != "pending":
+                    closed += close_alerts(db, key, note="Referral no longer pending")
+
+            logger.info(f"[Scheduler] Referral pending alerts DONE — raised={raised}, closed={closed}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Scheduler] Referral pending alerts FAILED — {str(e)}")
+
+
+def job_escalate_alerts():
+    """
+    Job: three-level escalation (responsible user -> Block -> District).
+      1. Close ANC alerts of women who delivered / were deactivated (nothing left to do).
+      2. Close pmsma_due alerts whose session is no longer scheduled/rescheduled.
+      3. Escalate every unresolved alert older than its limit (services/alert_rules.ESCALATION_HOURS).
+    Each step is written to escalation_logs (action = closed / escalated). Runs hourly.
+    """
+    logger.info(f"[Scheduler] Alert escalation started at {datetime.now()}")
+    try:
+        from database import SessionLocal
+        from models import Notification, PregnantWoman, PMSMASession
+        from services.alert_rules import close_alerts, escalate_unresolved_alerts
+
+        db = SessionLocal()
+        try:
+            closed = 0
+
+            anc_keys = db.query(Notification.alert_key).filter(
+                Notification.notification_type.in_(_ANC_ALERT_TYPES),
+                Notification.is_resolved == False,
+                Notification.alert_key.isnot(None),
+            ).distinct().all()
+            for (key,) in anc_keys:
+                try:
+                    pw_id = int(key.split(":")[1])
+                except Exception:
+                    continue
+                pw = db.query(PregnantWoman).filter(PregnantWoman.id == pw_id).first()
+                if not pw or not pw.is_active or pw.pregnancy_outcome:
+                    closed += close_alerts(db, key, note="Pregnancy no longer active")
+
+            pm_keys = db.query(Notification.alert_key).filter(
+                Notification.notification_type == "pmsma_due",
+                Notification.is_resolved == False,
+                Notification.alert_key.isnot(None),
+            ).distinct().all()
+            for (key,) in pm_keys:
+                try:
+                    sid = int(key.split(":")[1])
+                except Exception:
+                    continue
+                s = db.query(PMSMASession).filter(PMSMASession.id == sid).first()
+                if not s or s.status not in ("scheduled", "rescheduled"):
+                    closed += close_alerts(db, key, note="PMSMA session no longer due")
+
+            counts = escalate_unresolved_alerts(db)
+            logger.info(f"[Scheduler] Alert escalation DONE — closed={closed}, escalated={counts}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Scheduler] Alert escalation FAILED — {str(e)}")
 
 
 def start_scheduler():
@@ -595,7 +1041,15 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600
     )
-
+        # Job 4b: EDD action engine — daily at 6:15 AM
+    scheduler.add_job(
+        func=job_generate_edd_action_cases,
+        trigger=CronTrigger(hour=6, minute=15),
+        id="generate_edd_action_cases",
+        name="Generate EDD Action Cases",
+        replace_existing=True,
+        misfire_grace_time=3600
+    )
     # Job 5: Escalate stale mobilisation cases — every 4 hours
     scheduler.add_job(
         func=job_escalate_mobilisation_cases,
@@ -615,7 +1069,35 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600
     )
+        # Job 7: ANC / PMSMA time-based alerts (alert matrix) — daily at 7 AM
+    scheduler.add_job(
+        func=job_generate_anc_pmsma_alerts,
+        trigger=CronTrigger(hour=7, minute=0),
+        id="generate_anc_pmsma_alerts",
+        name="ANC / PMSMA Alerts",
+        replace_existing=True,
+        misfire_grace_time=3600
+    )
 
+    # Job 8: Referral pending alerts (DP + Block + District) — every 30 minutes
+    scheduler.add_job(
+        func=job_referral_pending_alerts,
+        trigger=CronTrigger(minute="*/30"),
+        id="referral_pending_alerts",
+        name="Referral Pending Alerts",
+        replace_existing=True,
+        misfire_grace_time=900
+    )
+
+    # Job 9: Three-level alert escalation + closure sweep — hourly at :10
+    scheduler.add_job(
+        func=job_escalate_alerts,
+        trigger=CronTrigger(minute=10),
+        id="escalate_alerts",
+        name="Alert Escalation (Sub-centre → Block → District)",
+        replace_existing=True,
+        misfire_grace_time=1800
+    )
     scheduler.start()
     logger.info("[Scheduler] APScheduler started successfully")
     logger.info("[Scheduler] Jobs registered:")

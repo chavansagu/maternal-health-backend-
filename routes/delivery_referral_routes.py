@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from typing import List, Optional
@@ -10,10 +10,11 @@ import json
 import logging
 
 from database import get_db
+from services.tracking_service import close_edd_cases,close_cases_on_admission
 from models import (
     DeliveryReferral, DeliveryOutcome, DeliveryOutcomeBaby, DeliveryPoint,
     PregnantWoman, ANCVisit, USGAppointment, User, ReferralStatus, SubCentre,
-    Discharge, PNCReminder, PNCReminderStatus, Admission, MaternalOutcome
+    Discharge, PNCReminder, PNCReminderStatus, Admission, MaternalOutcome,ReferralClinicalNote, PMSMASession
 )
 from schemas import (
     DeliveryReferralCreate, DeliveryReferralReRefer,
@@ -23,8 +24,12 @@ from schemas import (
 from auth import get_current_active_user
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 from services.notification_service import NotificationService
+from services.alert_rules import raise_alert, close_alerts
+from services.hrp_service import recompute_status
+from services.alert_sms import send_template_sms
 from file_validator import validate_upload_file
-
+from services.tracking_service import close_edd_cases
+from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/delivery-referrals", tags=["Delivery Referrals"])
@@ -50,6 +55,60 @@ def _load_pnc_reminder_offsets() -> list:
 
 
 PNC_REMINDER_OFFSETS = _load_pnc_reminder_offsets()
+
+def set_hrp_case_status(pw, outcome_data) -> None:
+    """HRP woman: outcome entry -> 'delivered'; maternal death -> 'case_closed'."""
+    if not pw or not pw.is_high_risk:
+        return
+    dt = getattr(outcome_data.delivery_type, "value", outcome_data.delivery_type)
+    mo = getattr(outcome_data.maternal_outcome, "value", outcome_data.maternal_outcome)
+    pw.hrp_case_status = "case_closed" if (dt == "maternal_death" or mo == "maternal_death") else "delivered"
+
+def close_delivery_alerts(db, referral, pw) -> None:
+    """Delivery outcome recorded -> close referral / admission / HRP alerts of this case (spec M)."""
+    keys = [f"referral:{referral.id}", f"referral_pending:{referral.id}", f"hrp_identified:{pw.id}"]
+    adm = db.query(Admission).filter(Admission.referral_id == referral.id).first()
+    if adm:
+        keys.append(f"admission:{adm.id}")
+    for k in keys:
+        close_alerts(db, k, note="Delivery outcome recorded", commit=False)
+    db.commit()
+
+
+def raise_death_alert_if_needed(db, pw, outcome_data, outcome) -> None:
+    """Maternal or newborn death recorded -> Block + District (alert matrix, spec M)."""
+    dt = getattr(outcome_data.delivery_type, "value", outcome_data.delivery_type)
+    mo = getattr(outcome_data.maternal_outcome, "value", outcome_data.maternal_outcome)
+    maternal_death = dt == "maternal_death" or mo == "maternal_death"
+    infant_deaths = sum(
+        1 for b in (outcome_data.babies or [])
+        if getattr(b.status, "value", b.status) == "infant_death"
+    )
+    newborn_death = dt == "infant_death" or infant_deaths > 0
+    if not (maternal_death or newborn_death):
+        return
+
+    if maternal_death and newborn_death:
+        what = "Maternal and newborn death"
+    elif maternal_death:
+        what = "Maternal death"
+    else:
+        what = "Newborn death"
+
+    raise_alert(
+        db, "death_recorded", pw,
+        title=f"{what} recorded",
+        message=f"{what} recorded for {pw.full_name}.",
+        alert_key=f"death_recorded:{outcome.id}",
+        reference_id=outcome.id,
+        reference_type="delivery_outcome",
+        action_url="/delivery-referral-management",
+        metadata={
+            "pregnant_woman_name": pw.full_name,
+            "maternal_death": maternal_death,
+            "newborn_death": newborn_death,
+        },
+    )
 
 
 def get_other_dp_id(db: Session) -> int:
@@ -79,13 +138,60 @@ def _resolve_babies(outcome: DeliveryOutcome) -> list:
     """Return babies list with backward-compat fallback to legacy baby_gender."""
     if outcome.babies:
         return [
-            {"baby_number": b.baby_number, "gender": b.gender, "status": b.status}
+            {"baby_number": b.baby_number, "gender": b.gender, "status": b.status,
+             "hep_b_given": b.hep_b_given, "bcg_given": b.bcg_given, "opv_given": b.opv_given}
             for b in sorted(outcome.babies, key=lambda x: x.baby_number)
         ]
     if outcome.baby_gender:
         return [{"baby_number": 1, "gender": outcome.baby_gender, "status": "live_birth"}]
     return []
 
+def get_lifecycle_stage(db: Session, referral: DeliveryReferral) -> str:
+    """Initiated → Accepted → Patient Reached → Admitted → Under Management
+       → Delivery/Outcome → Closed. (Re-referred if sent onward)"""
+    if referral.status == "re_referred":
+        return "Re-referred"
+    discharge = db.query(Discharge).filter(Discharge.referral_id == referral.id).first()
+    if discharge:
+        return "Closed"
+    outcome = db.query(DeliveryOutcome).filter(DeliveryOutcome.referral_id == referral.id).first()
+    if outcome:
+        return "Delivery/Outcome"
+    admission = db.query(Admission).filter(Admission.referral_id == referral.id).first()
+    if admission:
+        notes = db.query(ReferralClinicalNote).filter(
+            ReferralClinicalNote.referral_id == referral.id).count()
+        return "Under Management" if notes > 0 else "Admitted"
+    if referral.patient_reached_at:
+        return "Patient Reached"
+    if referral.status == "accepted":
+        return "Accepted"
+    return "Initiated"
+
+
+def build_onward_chain(db: Session, referral: DeliveryReferral) -> list:
+    """Walk FORWARD (referrals created from this one via re-refer).
+    Lets the referring DP see where the patient went after them."""
+    onward = []
+    current = referral
+    seen = set()
+    while current and current.id not in seen:
+        seen.add(current.id)
+        nxt = db.query(DeliveryReferral).filter(
+            DeliveryReferral.previous_referral_id == current.id
+        ).first()
+        if not nxt:
+            break
+        dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == nxt.dp_id).first()
+        onward.append({
+            "referral_id": nxt.id,
+            "dp_name": (nxt.other_facility_name or (dp.name if dp else None)),
+            "status": nxt.status,
+            "lifecycle_stage": get_lifecycle_stage(db, nxt),
+            "created_at": nxt.created_at,
+        })
+        current = nxt
+    return onward
 
 def build_referral_chain(db: Session, referral: DeliveryReferral) -> list:
     """Walk back through previous_referral_id to build full chain (oldest first)"""
@@ -150,6 +256,9 @@ def format_referral_detail(db: Session, referral: DeliveryReferral) -> dict:
             "observation_notes": referral.observation_notes,
             "re_refer_reason": referral.re_refer_reason,
             "treatment_given": referral.treatment_given,
+            "cause_of_referral": referral.cause_of_referral,
+            "other_facility_name": referral.other_facility_name,
+            "patient_reached_at": referral.patient_reached_at,
             "re_refer_attachment_urls": [
                 f"/uploads/referral_attachments/{os.path.basename(p)}"
                 for p in json.loads(referral.re_refer_attachment_paths)
@@ -158,8 +267,14 @@ def format_referral_detail(db: Session, referral: DeliveryReferral) -> dict:
             "created_at": referral.created_at,
             "updated_at": referral.updated_at,
             "dp_id": referral.dp_id,
-            "dp_name": dp.name if dp else None,
+            "dp_name": (
+                f"{dp.name} ({referral.other_facility_name})"
+                if dp and referral.other_facility_name
+                else (dp.name if dp else None)
+            ),
             "previous_referral_id": referral.previous_referral_id,
+            "lifecycle_stage": get_lifecycle_stage(db, referral),
+            "onward_chain": build_onward_chain(db, referral),
         },
         "pregnant_woman": {
             "id": pw.id,
@@ -233,6 +348,7 @@ def format_referral_detail(db: Session, referral: DeliveryReferral) -> dict:
             "id": admission.id,
             "admission_date": admission.admission_date,
             "treating_doctor": admission.treating_doctor,
+            "admission_source": admission.admission_source,
             "condition_at_admission": admission.condition_at_admission,
             "discharge_date": admission.discharge_date,
             "days_admitted": admission.days_admitted,
@@ -261,7 +377,89 @@ def format_referral_detail(db: Session, referral: DeliveryReferral) -> dict:
             "created_at": discharge.created_at,
         } if discharge else None,
     }
+# ─── Beneficiary Search (name / ABHA / RCH / mobile) ────────────────────────
 
+@router.get("/beneficiary-search", response_model=list)
+async def beneficiary_search(
+    q: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    if current_user.role not in ["sub_centre", "dp", "pmsma", "block", "district"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    q = (q or "").strip()
+    if len(q) < 3:
+        raise HTTPException(status_code=400, detail="Enter at least 3 characters")
+
+    like = f"%{q}%"
+    query = db.query(PregnantWoman).filter(
+        or_(
+            PregnantWoman.full_name.like(like),
+            PregnantWoman.abha_id.like(like),
+            PregnantWoman.rch_id.like(like),
+            PregnantWoman.mobile_number.like(like),
+        )
+    )
+    # Sub-centre / block / district scoping. DP & PMSMA can search all (walk-in cases)
+    if current_user.role == "sub_centre" and current_user.sub_centre_id:
+        query = query.filter(PregnantWoman.sub_centre_id == current_user.sub_centre_id)
+    elif current_user.role == "block":
+        query = query.filter(PregnantWoman.block_id == current_user.block_id)
+    elif current_user.role == "district":
+        query = query.filter(PregnantWoman.district_id == current_user.district_id)
+
+    return [{
+        "id": w.id, "full_name": w.full_name, "mobile_number": w.mobile_number,
+        "abha_id": w.abha_id, "rch_id": w.rch_id, "is_active": w.is_active,
+        "pregnancy_outcome": w.pregnancy_outcome,
+    } for w in query.limit(20).all()]
+
+
+@router.get("/beneficiary/{pw_id}/history", response_model=dict)
+async def beneficiary_history(
+    pw_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Full history for referral decision: ANC, HRP, PMSMA, USG + Tracking EDD"""
+    if current_user.role not in ["sub_centre", "dp", "pmsma", "block", "district"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    pw = db.query(PregnantWoman).filter(PregnantWoman.id == pw_id).first()
+    if not pw:
+        raise HTTPException(status_code=404, detail="Beneficiary not found")
+
+    from services.tracking_service import get_edd_info
+    anc = db.query(ANCVisit).filter(ANCVisit.pregnant_woman_id == pw_id)\
+        .order_by(ANCVisit.visit_date.desc()).all()
+    usg = db.query(USGAppointment).filter(USGAppointment.pregnant_woman_id == pw_id)\
+        .order_by(USGAppointment.id.desc()).all()
+    pmsma = db.query(PMSMASession).filter(PMSMASession.pregnant_woman_id == pw_id)\
+        .order_by(PMSMASession.scheduled_date.desc()).all()
+
+    return {
+        "woman": {
+            "id": pw.id, "full_name": pw.full_name, "mobile_number": pw.mobile_number,
+            "abha_id": pw.abha_id, "rch_id": pw.rch_id,
+            "is_high_risk": getattr(pw, "is_high_risk", None),
+            "lmp_date": str(pw.lmp_date) if getattr(pw, "lmp_date", None) else None,
+        },
+        "edd": get_edd_info(pw),
+        "anc_visits": [{
+            "visit_number": a.visit_number, "visit_date": str(a.visit_date),
+            "blood_pressure": a.blood_pressure, "hemoglobin": a.hemoglobin,
+            "weight": a.weight, "is_emergency": a.is_emergency,
+            "doctor_notes": a.doctor_notes,
+        } for a in anc],
+        "usg": [{
+            "id": u.id, "status": getattr(u, "status", None),
+            "scheduled_date": str(getattr(u, "scheduled_date", "") or ""),
+        } for u in usg],
+        "pmsma": [{
+            "id": p.id, "status": p.status, "scheduled_date": str(p.scheduled_date),
+            "appointment_type": p.appointment_type, "bp": p.bp, "hb": p.hb,
+            "blood_sugar": p.blood_sugar, "counselling_notes": p.counselling_notes,
+        } for p in pmsma],
+    }
 
 # ─── Available Delivery Points (risk-filtered) ──────────────────────────────
 
@@ -308,6 +506,7 @@ async def get_available_delivery_points(
 async def create_referral(
     referral_data: DeliveryReferralCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
@@ -373,12 +572,23 @@ async def create_referral(
     other_dp_id = get_other_dp_id(db)
     is_other_dp = (dp_id == other_dp_id)
 
+    errors = []
+    if not (referral_data.cause_of_referral or "").strip():
+        errors.append("Cause of referral is required")
+    if not (referral_data.observation_notes or "").strip():
+        errors.append("Referral note / primary management is required")
+    if is_other_dp and not (referral_data.other_facility_name or "").strip():
+        errors.append("Facility name is required when 'Other' is selected")
+    if errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
     referral = DeliveryReferral(
         pregnant_woman_id=referral_data.pregnant_woman_id,
         referred_by_user_id=current_user.id,
         sub_centre_id=sub_centre_id,
         dp_id=dp_id,
         observation_notes=referral_data.observation_notes,
+        cause_of_referral=referral_data.cause_of_referral.strip(),
+        other_facility_name=referral_data.other_facility_name.strip() if is_other_dp else None,
         status=ReferralStatus.ACCEPTED if is_other_dp else ReferralStatus.PENDING,
         accepted_by_user_id=current_user.id if is_other_dp else None,
         accepted_at=datetime.now() if is_other_dp else None,
@@ -409,47 +619,29 @@ async def create_referral(
             metadata={"pregnant_woman_name": pw.full_name}
         )
 
-    # Notify DP users (when sub_centre or pmsma creates and NOT Other DP)
-    if current_user.role in ("sub_centre", "pmsma") and not is_other_dp:
-        dp_users = db.query(User).filter(
-            User.dp_id == dp_id,
-            User.is_active == True
-        ).all()
-        if dp_users:
-            NotificationService.create_notification(
-                db=db,
-                user_ids=[u.id for u in dp_users],
-                title="New Delivery Referral",
-                message=f"New delivery referral received for {pw.full_name} from Sub-Centre",
-                notification_type="delivery_referral_new",
-                category="delivery",
-                priority="high",
-                reference_id=referral.id,
-                reference_type="delivery_referral",
-                action_url=f"/delivery-referrals/{referral.id}",
-                metadata={"pregnant_woman_name": pw.full_name}
-            )
 
-    # Notify target DP users when a DP user refers to another DP (not Other DP)
-    if current_user.role == "dp" and not is_other_dp:
-        target_dp_users = db.query(User).filter(
-            User.dp_id == dp_id,
-            User.is_active == True
-        ).all()
-        if target_dp_users:
-            NotificationService.create_notification(
-                db=db,
-                user_ids=[u.id for u in target_dp_users],
-                title="New Delivery Referral",
-                message=f"New delivery referral received for {pw.full_name} from {dp.name if dp else 'another Delivery Point'}",
-                notification_type="delivery_referral_new",
-                category="delivery",
-                priority="high",
-                reference_id=referral.id,
-                reference_type="delivery_referral",
-                action_url=f"/delivery-referrals/{referral.id}",
-                metadata={"pregnant_woman_name": pw.full_name}
-            )
+    # Referral initiated -> receiving DP + Block + District (alert matrix, spec M)
+    # Other DP Point is auto-accepted, so no alert is raised for it.
+    if not is_other_dp and current_user.role in ("sub_centre", "pmsma", "dp"):
+        _from = (dp.name if dp else "another Delivery Point") if current_user.role == "dp" else "Sub-Centre"
+        raise_alert(
+            db, "referral_initiated", pw,
+            title="New Delivery Referral",
+            message=f"New delivery referral received for {pw.full_name} from {_from}",
+            alert_key=f"referral:{referral.id}",
+            reference_id=referral.id,
+            reference_type="delivery_referral",
+            action_url=f"/delivery-referrals/{referral.id}",
+            context={"dp_id": dp_id},
+            metadata={"pregnant_woman_name": pw.full_name},
+        )
+
+    # DP referral -> SMS to the beneficiary (skipped until the DLT template id is configured)
+    if not is_other_dp:
+        background_tasks.add_task(
+            send_template_sms, "dp_referral", pw.mobile_number, pw.id,
+            DP=(dp.name if dp else "Delivery Point"),
+        )
 
     return {"message": "Referral created successfully", "referral_id": referral.id, "is_other_dp": is_other_dp}
 
@@ -554,6 +746,9 @@ async def get_referrals(
             "previous_referral_id": r.previous_referral_id,
             "is_discharged": discharge is not None,
             "is_admitted": admission is not None,
+            "lifecycle_stage": get_lifecycle_stage(db, r),
+            "onward_chain": build_onward_chain(db, r),
+            "patient_reached_at": r.patient_reached_at,
             "days_admitted": admission.days_admitted if admission else None,
             "created_at": r.created_at,
             "updated_at": r.updated_at,
@@ -603,7 +798,86 @@ async def get_referral_detail(
 
     return format_referral_detail(db, referral)
 
+# ─── Clinical Notes (treatment / observation) ───────────────────────────────
 
+class ClinicalNoteRequest(BaseModel):
+    note_type: str  # treatment / observation
+    note: str
+
+
+def _get_referral_with_access(db, referral_id, current_user):
+    referral = db.query(DeliveryReferral).filter(DeliveryReferral.id == referral_id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Referral not found")
+    if current_user.role == "dp" and referral.dp_id != current_user.dp_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.role == "sub_centre" and referral.sub_centre_id != current_user.sub_centre_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return referral
+
+
+@router.get("/{referral_id}/clinical-notes", response_model=list)
+async def list_clinical_notes(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    _get_referral_with_access(db, referral_id, current_user)
+    notes = db.query(ReferralClinicalNote).filter(ReferralClinicalNote.referral_id == referral_id)\
+        .order_by(ReferralClinicalNote.recorded_at.desc()).all()
+    out = []
+    for n in notes:
+        u = db.query(User).filter(User.id == n.recorded_by).first()
+        out.append({
+            "id": n.id, "note_type": n.note_type, "note": n.note,
+            "recorded_by": u.full_name if u else None,
+            "recorded_at": n.recorded_at.isoformat() if n.recorded_at else None,
+        })
+    return out
+
+
+@router.post("/{referral_id}/clinical-notes", response_model=dict, status_code=201)
+async def add_clinical_note(
+    referral_id: int,
+    data: ClinicalNoteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    if current_user.role not in ["dp", "sub_centre", "pmsma"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    _get_referral_with_access(db, referral_id, current_user)
+    if data.note_type not in ("treatment", "observation"):
+        raise HTTPException(status_code=400, detail="note_type must be treatment or observation")
+    if not data.note or not data.note.strip():
+        raise HTTPException(status_code=400, detail="Note is required")
+    n = ReferralClinicalNote(
+        referral_id=referral_id, note_type=data.note_type, note=data.note.strip(),
+        recorded_by=current_user.id, recorded_at=datetime.utcnow(),
+    )
+    db.add(n)
+    db.commit()
+    return {"message": "Note added", "id": n.id}
+
+
+# ─── Mark Patient Reached ───────────────────────────────────────────────────
+
+@router.post("/{referral_id}/patient-reached", response_model=dict)
+async def mark_patient_reached(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    if current_user.role != "dp":
+        raise HTTPException(status_code=403, detail="Only Delivery Point can mark patient reached")
+    referral = _get_referral_with_access(db, referral_id, current_user)
+    if referral.status not in ("accepted", ReferralStatus.accepted):
+        raise HTTPException(status_code=400, detail="Referral must be accepted first")
+    if referral.patient_reached_at:
+        raise HTTPException(status_code=400, detail="Already marked reached")
+    referral.patient_reached_at = datetime.utcnow()
+    referral.patient_reached_by = current_user.id
+    db.commit()
+    return {"message": "Patient marked as reached"}
 # ─── DP: Accept Referral (Proceed to Delivery) ──────────────────────────────
 
 @router.post("/{referral_id}/accept", response_model=dict)
@@ -632,6 +906,10 @@ async def accept_referral(
     referral.accepted_by_user_id = current_user.id
     referral.accepted_at = datetime.now()
     db.commit()
+
+    # Required entry done (DP accepted) -> close referral alerts (spec M)
+    close_alerts(db, f"referral:{referral.id}", note="Referral accepted by DP")
+    close_alerts(db, f"referral_pending:{referral.id}", note="Referral accepted by DP")
 
     ip_address, user_agent = get_client_info(request)
     log_update(db, current_user.id, "DeliveryReferral", referral.id, old_values, get_entity_snapshot(referral), ip_address, user_agent)
@@ -699,38 +977,36 @@ async def create_admission(
         dp_id=current_user.dp_id,
         admission_date=admission_data.admission_date,
         treating_doctor=admission_data.treating_doctor,
+        admission_source=admission_data.admission_source,
         condition_at_admission=admission_data.condition_at_admission,
         admitted_by=current_user.id,
     )
     db.add(admission)
+    close_cases_on_admission(
+        db, referral.pregnant_woman_id, current_user.id, current_user.dp_id,
+        admission_data.admission_date,
+    )
+    db.commit()
     db.commit()
     db.refresh(admission)
 
     ip_address, user_agent = get_client_info(request)
     log_create(db, current_user.id, "Admission", admission.id, get_entity_snapshot(admission), ip_address, user_agent)
 
-    # Notify sub-centre
+    # Admission confirmed -> Sub-centre + Block + District (alert matrix, spec M)
     pw = db.query(PregnantWoman).filter(PregnantWoman.id == referral.pregnant_woman_id).first()
-    if referral.sub_centre_id:
-        sc_users = db.query(User).filter(
-            User.sub_centre_id == referral.sub_centre_id,
-            User.is_active == True
-        ).all()
-        if sc_users:
-            dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == referral.dp_id).first()
-            NotificationService.create_notification(
-                db=db,
-                user_ids=[u.id for u in sc_users],
-                title="Patient Admitted",
-                message=f"{pw.full_name} has been admitted at {dp.name if dp else 'the DP'}",
-                notification_type="delivery_admission_recorded",
-                category="delivery",
-                priority="normal",
-                reference_id=admission.id,
-                reference_type="admission",
-                action_url=f"/delivery-referrals/{referral.id}",
-                metadata={"pregnant_woman_name": pw.full_name}
-            )
+    dp = db.query(DeliveryPoint).filter(DeliveryPoint.id == referral.dp_id).first()
+    raise_alert(
+        db, "admission_confirmed", pw,
+        title="Patient Admitted",
+        message=f"{pw.full_name} has been admitted at {dp.name if dp else 'the DP'}",
+        alert_key=f"admission:{admission.id}",
+        reference_id=admission.id,
+        reference_type="admission",
+        action_url=f"/delivery-referrals/{referral.id}",
+        context={"sub_centre_id": referral.sub_centre_id},
+        metadata={"pregnant_woman_name": pw.full_name},
+    )
 
     return {
         "message": "Admission recorded successfully",
@@ -738,6 +1014,7 @@ async def create_admission(
         "referral_id": referral.id,
         "admission_date": admission.admission_date,
         "treating_doctor": admission.treating_doctor,
+        "admission_source": admission.admission_source,
         "condition_at_admission": admission.condition_at_admission,
         "days_admitted": admission.days_admitted,
     }
@@ -803,6 +1080,7 @@ async def re_refer(
     new_dp_id: int = Form(...),
     re_refer_reason: str = Form(...),
     treatment_given: Optional[str] = Form(None),
+    other_facility_name: Optional[str] = Form(None),
     attachment_files: Optional[UploadFile] = File(default=None)
 ):
     """DP re-refers to another DP with reason, optional treatment given and attachments"""
@@ -839,7 +1117,18 @@ async def re_refer(
 
     if new_dp_id == current_user.dp_id:
         raise HTTPException(status_code=400, detail="Cannot re-refer to the same Delivery Point")
+    other_dp_id = get_other_dp_id(db)
+    is_other_dp = (new_dp_id == other_dp_id)
 
+    errors = []
+    if not (re_refer_reason or "").strip():
+        errors.append("Cause of re-referral is required")
+    if not (treatment_given or "").strip():
+        errors.append("Referral note / primary management (treatment given) is required")
+    if is_other_dp and not (other_facility_name or "").strip():
+        errors.append("Facility name is required when 'Other' is selected")
+    if errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
     # Save attachment files if provided — read all files from raw form
     attachment_paths = []
     try:
@@ -859,6 +1148,8 @@ async def re_refer(
     referral.re_refer_attachment_path = attachment_paths[0] if attachment_paths else None
     referral.re_refer_attachment_paths = json.dumps(attachment_paths) if attachment_paths else None
     db.commit()
+    close_alerts(db, f"referral:{referral.id}", note="Referral re-referred to another DP")
+    close_alerts(db, f"referral_pending:{referral.id}", note="Referral re-referred to another DP")
 
     # Create new referral in chain
     pw = db.query(PregnantWoman).filter(PregnantWoman.id == referral.pregnant_woman_id).first()
@@ -869,7 +1160,12 @@ async def re_refer(
         dp_id=new_dp_id,
         previous_referral_id=referral.id,
         observation_notes=referral.observation_notes,
-        status="pending",
+        cause_of_referral=re_refer_reason.strip(),
+        other_facility_name=other_facility_name.strip() if is_other_dp else None,
+        # Other DP ka koi user nahi hota, to create_referral ki tarah auto-accept
+        status="accepted" if is_other_dp else "pending",
+        accepted_by_user_id=current_user.id if is_other_dp else None,
+        accepted_at=datetime.now() if is_other_dp else None,
     )
     db.add(new_referral)
     db.commit()
@@ -879,25 +1175,21 @@ async def re_refer(
     log_update(db, current_user.id, "DeliveryReferral", referral.id, old_values, get_entity_snapshot(referral), ip_address, user_agent)
     log_create(db, current_user.id, "DeliveryReferral", new_referral.id, get_entity_snapshot(new_referral), ip_address, user_agent)
 
-    # Notify new DP users
-    new_dp_users = db.query(User).filter(
-        User.dp_id == new_dp_id,
-        User.is_active == True
-    ).all()
-    if new_dp_users:
-        NotificationService.create_notification(
-            db=db,
-            user_ids=[u.id for u in new_dp_users],
-            title="Delivery Referral Received",
-            message=f"Referral for {pw.full_name} forwarded to your Delivery Point",
-            notification_type="delivery_referral_new",
-            category="delivery",
-            priority="high",
-            reference_id=new_referral.id,
-            reference_type="delivery_referral",
-            action_url=f"/delivery-referrals/{new_referral.id}",
-            metadata={"pregnant_woman_name": pw.full_name, "re_referred": True}
-        )
+    # Referral initiated (forwarded) -> new DP + Block + District (alert matrix, spec M)
+    raise_alert(
+        db, "referral_initiated", pw,
+        title="Delivery Referral Received",
+        message=f"Referral for {pw.full_name} forwarded to your Delivery Point",
+        alert_key=f"referral:{new_referral.id}",
+        reference_id=new_referral.id,
+        reference_type="delivery_referral",
+        action_url=f"/delivery-referrals/{new_referral.id}",
+        context={"dp_id": new_dp_id},
+        metadata={"pregnant_woman_name": pw.full_name, "re_referred": True},
+    )
+
+    # Re-referral is a DP referral too -> SMS to the beneficiary (skipped until DLT id is configured)
+    await send_template_sms("dp_referral", pw.mobile_number, pw.id, DP=new_dp.name)
 
     # Notify sub-centre
     if referral.sub_centre_id:
@@ -991,7 +1283,9 @@ async def record_outcome(
     pw.pregnancy_outcome = outcome_data.delivery_type.value
     pw.outcome_date = outcome_data.delivery_date.date()
     pw.is_active = False
-
+    set_hrp_case_status(pw, outcome_data)  
+    recompute_status(db, pw, user_id=current_user.id, note="Delivery outcome recorded")
+    close_edd_cases(db, pw.id)
     db.flush()  # get outcome.id before creating babies
 
     babies_response = []
@@ -1002,9 +1296,13 @@ async def record_outcome(
                 baby_number=idx + 1,
                 gender=baby.gender.value,
                 status=baby.status,
+                hep_b_given=baby.hep_b_given,
+                bcg_given=baby.bcg_given,
+                opv_given=baby.opv_given,
             )
             db.add(baby_row)
-            babies_response.append({"baby_number": idx + 1, "gender": baby.gender.value, "status": baby.status})
+            babies_response.append({"baby_number": idx + 1, "gender": baby.gender.value, "status": baby.status,
+                                    "hep_b_given": baby.hep_b_given, "bcg_given": baby.bcg_given, "opv_given": baby.opv_given})
 
     db.commit()
     db.refresh(outcome)
@@ -1040,6 +1338,9 @@ async def record_outcome(
                     "maternal_outcome": outcome_data.maternal_outcome.value,
                 }
             )
+
+    close_delivery_alerts(db, referral, pw)
+    raise_death_alert_if_needed(db, pw, outcome_data, outcome)
 
     return {
         "message": "Delivery outcome recorded successfully",
@@ -1119,7 +1420,9 @@ async def record_outcome_by_subcentre(
     pw.pregnancy_outcome = outcome_data.delivery_type.value
     pw.outcome_date = outcome_data.delivery_date.date()
     pw.is_active = False
-
+    set_hrp_case_status(pw, outcome_data)
+    recompute_status(db, pw, user_id=current_user.id, note="Delivery outcome recorded")
+    close_edd_cases(db, pw.id)
     db.flush()
 
     babies_response = []
@@ -1169,6 +1472,9 @@ async def record_outcome_by_subcentre(
             action_url="/delivery-referral-management",
             metadata={"pregnant_woman_name": pw.full_name, "delivery_type": outcome_data.delivery_type.value, "maternal_outcome": outcome_data.maternal_outcome.value}
         )
+
+    close_delivery_alerts(db, referral, pw)
+    raise_death_alert_if_needed(db, pw, outcome_data, outcome)
 
     return {
         "message": "Delivery outcome recorded successfully",

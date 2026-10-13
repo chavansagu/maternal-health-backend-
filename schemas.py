@@ -313,7 +313,9 @@ class PregnantWomanBase(BaseSchema):
 
 class PregnantWomanCreate(PregnantWomanBase):
     is_self_registered: bool = False
-
+    is_difficult_area: bool = False
+    is_migrant_worker: bool = False
+    mcp_card_conditions: List[str] = []   # MCP card se tick kiye gaye HRP conditions
 class PregnantWomanSelfRegister(BaseSchema):
     full_name: str
     mobile_number: str
@@ -347,6 +349,8 @@ class PregnantWomanUpdate(BaseSchema):
     pregnancy_outcome: Optional[str] = None
     outcome_date: Optional[date] = None
     is_active: Optional[bool] = None
+    is_difficult_area: Optional[bool] = None
+    is_migrant_worker: Optional[bool] = None
 
 class PregnantWomanResponse(PregnantWomanBase):
     id: int
@@ -356,6 +360,9 @@ class PregnantWomanResponse(PregnantWomanBase):
     registration_approved: bool
     is_active: bool
     created_at: datetime
+    hrp_status: str = "no_risk"
+    is_difficult_area: bool = False
+    is_migrant_worker: bool = False
 
 class PregnantWomanBulkUpload(BaseSchema):
     records: List[PregnantWomanCreate]
@@ -537,6 +544,11 @@ class NotificationResponse(NotificationBase):
     read_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     created_at: datetime
+    # Alert tracking (spec M)
+    alert_key: Optional[str] = None
+    is_resolved: bool = False
+    resolved_at: Optional[datetime] = None
+    escalation_level: Optional[str] = None
 
 class NotificationUpdate(BaseSchema):
     is_read: Optional[bool] = None
@@ -793,7 +805,9 @@ class PMSMACentreResponse(PMSMACentreBase):
 class DeliveryReferralCreate(BaseSchema):
     pregnant_woman_id: int
     dp_id: int
-    observation_notes: Optional[str] = None
+    observation_notes: Optional[str] = None      # referral note / primary management
+    cause_of_referral: Optional[str] = None
+    other_facility_name: Optional[str] = None    # jab "Other" DP chuna ho
 
 class DeliveryReferralReRefer(BaseSchema):
     new_dp_id: int
@@ -815,11 +829,23 @@ class DeliveryReferralResponse(BaseSchema):
     updated_at: datetime
 
 # Admission Schemas
+ADMISSION_SOURCES = {
+    "referred_from_subcentre", "walk_in", "ambulance",
+    "referred_from_other_facility", "other",
+}
+
+
 class AdmissionCreate(BaseSchema):
     admission_date: datetime
+    admission_source: str
     treating_doctor: Optional[str] = None
     condition_at_admission: Optional[str] = None
 
+    @validator("admission_source")
+    def validate_admission_source(cls, v):
+        if v not in ADMISSION_SOURCES:
+            raise ValueError(f"admission_source must be one of {sorted(ADMISSION_SOURCES)}")
+        return v
 
 class AdmissionUpdate(BaseSchema):
     treating_doctor: Optional[str] = None
@@ -833,6 +859,7 @@ class AdmissionResponse(BaseSchema):
     pregnant_woman_id: int
     dp_id: int
     admission_date: datetime
+    admission_source: Optional[str] = None
     treating_doctor: Optional[str] = None
     condition_at_admission: Optional[str] = None
     discharge_date: Optional[datetime] = None
@@ -850,10 +877,12 @@ DELIVERY_TYPES_REQUIRING_BABIES = {
     DeliveryTypeEnum.INFANT_DEATH,
 }
 
-
 class BabyCreate(BaseSchema):
     gender: BabyGenderEnum
     status: str  # live_birth | still_birth | infant_death
+    hep_b_given: bool = False
+    bcg_given: bool = False
+    opv_given: bool = False
 
     @validator("status")
     def validate_status(cls, v):
@@ -861,12 +890,21 @@ class BabyCreate(BaseSchema):
             raise ValueError(f"status must be one of {sorted(BABY_STATUSES)}")
         return v
 
+    @validator("opv_given")
+    def validate_vaccines(cls, v, values):
+        # vaccines only apply to live births
+        if values.get("status") == "still_birth" and (v or values.get("hep_b_given") or values.get("bcg_given")):
+            raise ValueError("Vaccination cannot be recorded for a still birth")
+        return v
+
 
 class BabyResponse(BaseSchema):
     baby_number: int
     gender: str
     status: str
-
+    hep_b_given: bool = False
+    bcg_given: bool = False
+    opv_given: bool = False
 
 class DeliveryOutcomeCreate(BaseSchema):
     delivery_type: DeliveryTypeEnum
@@ -875,15 +913,22 @@ class DeliveryOutcomeCreate(BaseSchema):
     maternal_outcome: MaternalOutcomeEnum = MaternalOutcomeEnum.HEALTHY
     maternal_outcome_notes: Optional[str] = None
     remarks: Optional[str] = None
-
+    
+    @validator("delivery_date")
+    def validate_delivery_date(cls, v):
+        from datetime import timedelta
+        now = datetime.now()
+        if v.replace(tzinfo=None) > now + timedelta(minutes=5):
+            raise ValueError("Delivery date/time cannot be in the future")
+        return v
     @validator("babies", always=True)
     def validate_babies(cls, v, values):
         delivery_type = values.get("delivery_type")
         if delivery_type in DELIVERY_TYPES_REQUIRING_BABIES:
             if not v or len(v) == 0:
                 raise ValueError("At least 1 baby is required for this delivery type")
-            if len(v) > 5:
-                raise ValueError("Maximum 5 babies allowed")
+            if len(v) > 3:
+                raise ValueError("Maximum 3 newborns allowed (single / twins / triplets)")
         if delivery_type == DeliveryTypeEnum.MATERNAL_DEATH:
             if v and len(v) > 0:
                 raise ValueError("babies must not be provided for maternal_death")

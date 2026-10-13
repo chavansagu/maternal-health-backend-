@@ -242,6 +242,8 @@ class PregnantWoman(Base):
     # Pregnancy Information
     lmp_date = Column(Date)  # Last Menstrual Period
     edd_date = Column(Date)  # Expected Date of Delivery
+    lmp_edd_date = Column(Date, nullable=True)  # LMP-based EDD, kept permanently
+    usg_edd_date = Column(Date, nullable=True)  # USG EDD from first scan, kept permanently
     pregnancy_registration_date = Column(Date, default=datetime.now)
     gravida = Column(Integer)  # Number of pregnancies
     para = Column(Integer)  # Number of births
@@ -250,6 +252,11 @@ class PregnantWoman(Base):
     hpr_id = Column(String(50))  # Healthcare Professional Registry ID
     blood_group = Column(String(10))
     is_high_risk = Column(Boolean, default=False)
+    hrp_case_status = Column(String(30), nullable=True)  # delivered / case_closed
+     # --- HRP module (spec D) ---
+    hrp_status = Column(String(30), nullable=False, default="no_risk", server_default="no_risk", index=True)
+    is_difficult_area = Column(Boolean, nullable=False, default=False, server_default="0")
+    is_migrant_worker = Column(Boolean, nullable=False, default=False, server_default="0")
     risk_factors = Column(Text)
     
     # Registration Source
@@ -274,6 +281,7 @@ class PregnantWoman(Base):
     feedback_records = relationship("FeedbackRecord", back_populates="pregnant_woman")
     delivery_referrals = relationship("DeliveryReferral", back_populates="pregnant_woman")
     ecg_reports = relationship("ECGReport", back_populates="pregnant_woman")
+    hrp_conditions = relationship("HRPCondition", back_populates="pregnant_woman")
 
 # ANC Visits
 class ANCVisit(Base):
@@ -501,13 +509,51 @@ class Notification(Base):
     is_read = Column(Boolean, default=False, index=True)
     read_at = Column(DateTime)
     deleted_at = Column(DateTime, index=True)
+    # Alert tracking (M module)
+    alert_key = Column(String(100), nullable=True, index=True)  # dedupe + closure key
+    is_resolved = Column(Boolean, default=False, nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    escalation_level = Column(String(20), nullable=True)  # sub_centre / block / district
+    # Offline sync: set when the client acknowledges receipt (POST /notifications/sync/ack)
+    delivered_at = Column(DateTime, nullable=True, index=True)
     
     created_at = Column(DateTime, default=datetime.now, index=True)
     
     # Relationships
     user = relationship("User")
 
+
+class DeviceToken(Base):
+    """Push notification (FCM) device / browser tokens registered by a user."""
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String(512), nullable=False, index=True)
+    platform = Column(String(20), nullable=False, default="web")  # web / android / ios
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+    last_seen_at = Column(DateTime, default=datetime.now)
+
+    user = relationship("User")
+
 # Password Reset Token
+class EscalationLog(Base):
+    __tablename__ = "escalation_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_key = Column(String(100), nullable=True, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    pregnant_woman_id = Column(Integer, ForeignKey("pregnant_women.id"), nullable=True, index=True)
+    reference_type = Column(String(50), nullable=True)
+    reference_id = Column(Integer, nullable=True)
+    level = Column(String(20), nullable=False)       # sub_centre / block / district / dp / pmsma / usg
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(30), nullable=False)      # notified / escalated / closed
+    action_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    user = relationship("User")
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
     
@@ -584,6 +630,10 @@ class DeliveryReferral(Base):
     re_refer_attachment_paths = Column(Text, nullable=True)  # JSON array of all file paths
     accepted_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     accepted_at = Column(DateTime)
+    cause_of_referral = Column(Text, nullable=True)            # clinical reason (spec K)
+    other_facility_name = Column(String(255), nullable=True)   # jab "Other" DP select ho
+    patient_reached_at = Column(DateTime, nullable=True)
+    patient_reached_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -598,6 +648,21 @@ class DeliveryReferral(Base):
     admission = relationship("Admission", back_populates="referral", uselist=False)
 
 
+
+class ReferralClinicalNote(Base):
+    """Treatment / clinical observation entries on a referral (spec K)."""
+    __tablename__ = "referral_clinical_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    referral_id = Column(Integer, ForeignKey("delivery_referrals.id"), nullable=False, index=True)
+    note_type = Column(String(20), nullable=False)   # treatment / observation
+    note = Column(Text, nullable=False)
+    recorded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recorded_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+    referral = relationship("DeliveryReferral")
+    recorded_by_user = relationship("User", foreign_keys=[recorded_by])
 # Admission — records the hospital stay between an accepted referral and the
 # delivery outcome. Facility is implicitly the DP (dp_id), since a DP *is* the
 # facility in this system (see DeliveryPoint). days_admitted is intentionally
@@ -615,6 +680,7 @@ class Admission(Base):
     admission_date = Column(DateTime, nullable=False)
     treating_doctor = Column(String(255), nullable=True)
     condition_at_admission = Column(String(100), nullable=True)
+    admission_source = Column(String(40), nullable=True)
     discharge_date = Column(DateTime, nullable=True)
 
     admitted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -687,6 +753,9 @@ class DeliveryOutcomeBaby(Base):
     baby_number = Column(Integer, nullable=False)
     gender = Column(String(10), nullable=False)
     status = Column(String(20), nullable=False)  # live_birth, still_birth, infant_death
+    hep_b_given = Column(Boolean, default=False, nullable=False)
+    bcg_given = Column(Boolean, default=False, nullable=False)
+    opv_given = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
@@ -1014,7 +1083,17 @@ class MobilisationCase(Base):
     )
     escalation_level = Column(String(20), default="anm", nullable=False)  # anm -> block -> district
     escalated_at = Column(DateTime, nullable=True)
-
+    priority = Column(String(20), default="normal", nullable=False, index=True)  # normal / high / red_flag / critical
+    pending_action = Column(String(255), nullable=True)   # e.g. "Mobilise to facility immediately"
+    responsible_role = Column(String(30), nullable=True)  # sub_centre / block / district
+    # Stage-wise mobilisation workflow (spec J)
+    mobilisation_stage = Column(String(30), default="pending", nullable=False, index=True)  # pending/contacted/planned/mobilised/reached_facility/admitted
+    current_location = Column(String(20), nullable=True)      # at_dp / not_at_dp
+    contact_status = Column(String(30), nullable=True)        # beneficiary_reached / family_reached / not_reachable
+    contact_number = Column(String(15), nullable=True)
+    selected_dp_id = Column(Integer, ForeignKey("delivery_points.id"), nullable=True)
+    reason_not_completed = Column(Text, nullable=True)
+    stage_updated_at = Column(DateTime, nullable=True)
     mobilised_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     mobilised_at = Column(DateTime, nullable=True)
     remarks = Column(Text, nullable=True)
@@ -1027,12 +1106,33 @@ class MobilisationCase(Base):
     block = relationship("Block")
     district = relationship("District")
     mobilised_by_user = relationship("User", foreign_keys=[mobilised_by])
+    selected_dp = relationship("DeliveryPoint", foreign_keys=[selected_dp_id])
 
     __table_args__ = (
         Index("ix_mobilisation_status_scope", "status", "sub_centre_id", "block_id", "district_id"),
     )
 
 
+
+class MobilisationAction(Base):
+    """History log: har stage update ka ek row (kab, kisne, kya)."""
+    __tablename__ = "mobilisation_actions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("mobilisation_cases.id"), nullable=False, index=True)
+    action_datetime = Column(DateTime, nullable=False)
+    mobilisation_stage = Column(String(30), nullable=False)
+    current_location = Column(String(20), nullable=True)
+    contact_status = Column(String(30), nullable=True)
+    contact_number = Column(String(15), nullable=True)
+    selected_dp_id = Column(Integer, ForeignKey("delivery_points.id"), nullable=True)
+    reason_not_completed = Column(Text, nullable=True)
+    recorded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+    case = relationship("MobilisationCase")
+    selected_dp = relationship("DeliveryPoint", foreign_keys=[selected_dp_id])
+    recorded_by_user = relationship("User", foreign_keys=[recorded_by])
 class IVRCallLog(Base):
     __tablename__ = "ivr_call_logs"
 
@@ -1058,3 +1158,53 @@ class IVRCallLog(Base):
 
     # Relationship
     pregnant_woman = relationship("PregnantWoman")
+# ─── HRP Module (spec D) ─────────────────────────────────────────────────────
+# HRP_SOURCES: mcp_card / difficult_area / migrant_worker / pmsma / usg / anc_auto / manual
+# HRP_STATUSES: no_risk / risk_identified / under_follow_up / multiple_conditions / delivery_planned / case_closed
+
+class HRPCondition(Base):
+    """Ek HRP condition ka ek row. Naya condition purane ko replace nahi karta."""
+    __tablename__ = "hrp_conditions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pregnant_woman_id = Column(Integer, ForeignKey("pregnant_women.id"), nullable=False, index=True)
+    condition_name = Column(String(150), nullable=False)
+    category = Column(String(100), nullable=True)          # master list aane par use hoga (Scrumlin)
+    source = Column(String(30), nullable=False, index=True)
+    source_reference_type = Column(String(30), nullable=True)   # pmsma_session / usg_appointment / anc_visit
+    source_reference_id = Column(Integer, nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    is_active = Column(Boolean, nullable=False, default=True)
+    identified_by = Column(Integer, ForeignKey("users.id"), nullable=True)   # NULL = system
+    identified_at = Column(DateTime, default=datetime.now, nullable=False)
+    resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+    pregnant_woman = relationship("PregnantWoman", back_populates="hrp_conditions")
+    identified_by_user = relationship("User", foreign_keys=[identified_by])
+    resolved_by_user = relationship("User", foreign_keys=[resolved_by])
+
+    __table_args__ = (
+        UniqueConstraint("pregnant_woman_id", "condition_name", "source", name="uq_hrp_pw_condition_source"),
+    )
+
+
+class HRPStatusLog(Base):
+    """HRP status / condition change ka log (kisne, kab)."""
+    __tablename__ = "hrp_status_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pregnant_woman_id = Column(Integer, ForeignKey("pregnant_women.id"), nullable=False, index=True)
+    action = Column(String(30), nullable=False)       # condition_added / status_changed / condition_resolved
+    old_status = Column(String(30), nullable=True)
+    new_status = Column(String(30), nullable=True)
+    condition_id = Column(Integer, ForeignKey("hrp_conditions.id"), nullable=True)
+    source = Column(String(30), nullable=True)
+    note = Column(Text, nullable=True)
+    changed_by = Column(Integer, ForeignKey("users.id"), nullable=True)   # NULL = system
+    changed_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    pregnant_woman = relationship("PregnantWoman")
+    condition = relationship("HRPCondition")
+    changed_by_user = relationship("User", foreign_keys=[changed_by])    

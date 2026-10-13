@@ -11,6 +11,8 @@ from auth import get_current_active_user
 from audit_utils import get_client_info, get_entity_snapshot, log_create, log_update
 from services.notification_service import NotificationService
 from services.tracking_service import get_tracking_info
+from services.alert_rules import close_alerts
+from services.hrp_service import add_conditions
 
 router = APIRouter(prefix="/pmsma-sessions", tags=["PMSMA Sessions"])
 
@@ -42,6 +44,7 @@ class PMSMASessionCreate(BaseModel):
     pmsma_centre_id: Optional[int] = None
     site: Optional[str] = None  # free-text fallback, used only if pmsma_centre_id is not set
     appointment_type: str = "regular"
+    visit_type: str = "regular"  # regular / additional (HRP only)
 
 
 class PMSMASessionComplete(BaseModel):
@@ -204,7 +207,10 @@ async def schedule_pmsma_session(
             status_code=400,
             detail=f"Cannot schedule PMSMA session. Beneficiary '{pw.full_name}' has already completed delivery.",
         )
-
+    if body.visit_type not in ("regular", "additional"):
+        raise HTTPException(status_code=400, detail="Invalid visit type")
+    if body.visit_type == "additional" and not pw.is_high_risk:
+        raise HTTPException(status_code=400, detail="Additional PMSMA visits are only for high-risk pregnancies")
     centre = None
     if body.pmsma_centre_id:
         centre = db.query(PMSMACentre).filter(PMSMACentre.id == body.pmsma_centre_id).first()
@@ -233,6 +239,7 @@ async def schedule_pmsma_session(
         site=body.site if not centre else centre.name,
         pmsma_centre_id=body.pmsma_centre_id,
         appointment_type=body.appointment_type,
+        visit_type=body.visit_type,
         status="scheduled",
         is_high_risk=bool(pw.is_high_risk),
         scheduled_by=current_user.id,
@@ -568,6 +575,7 @@ async def complete_pmsma_session(
     ).count()
 
     session.status = "completed"
+    close_alerts(db, f"pmsma_due:{session.id}", note="PMSMA session completed", commit=False)
     session.bp = body.bp
     session.blood_sugar = body.blood_sugar
     session.hb = body.hb
@@ -576,7 +584,7 @@ async def complete_pmsma_session(
     session.counselling_notes = body.counselling_notes
     session.visit_date = body.visit_date or date.today()
     session.visit_number = prior + 1
-    session.visit_type = "regular" if prior == 0 else "additional"
+    # session.visit_type = "regular" if prior == 0 else "additional"
     session.findings = body.findings
     session.recommended_action = body.recommended_action
     session.recommended_dp_id = body.recommended_dp_id
@@ -607,12 +615,11 @@ async def complete_pmsma_session(
             )
 
     if detected and pw:
-        newly_flagged = not pw.is_high_risk
-        pw.is_high_risk = True
-        existing = pw.risk_factors or ""
-        new_labels = [d for d in detected if d not in existing]
-        if new_labels:
-            pw.risk_factors = (existing + "; " if existing else "") + "PMSMA: " + ", ".join(new_labels)
+        _res = add_conditions(
+            db, pw, detected, "pmsma", user_id=current_user.id,
+            reference_type="pmsma_session", reference_id=session.id,
+        )
+        newly_flagged = _res["newly_flagged"]
         db.commit()
 
         recipients = NotificationService.get_recipients_for_event(
@@ -683,6 +690,7 @@ async def reschedule_pmsma_session(
     session.is_emergency_override = window["is_override"]
     session.override_reason = window["reason"]
     session.updated_at = datetime.now()
+    close_alerts(db, f"pmsma_due:{session.id}", note="PMSMA session rescheduled", commit=False)
     db.commit()
     db.refresh(session)
 
