@@ -595,7 +595,7 @@ def serialize_rows(results):
 # ----------------------------------------------------------------------------
 # Phase 2: execution
 # ----------------------------------------------------------------------------
-def _create(db, entity, cfg, d, user):
+def _create(db, entity, cfg, d, user,map_all_wards=True):
     M = cfg["model"]
     vals = {f[0]: d.get(f[0]) for f in cfg["fields"] if f[0] != "is_private" and f[0] != "is_sdh_dhh"}
     if entity == "blocks":
@@ -610,10 +610,12 @@ def _create(db, entity, cfg, d, user):
         obj = M(**vals, block_id=d["block_id"])
         db.add(obj)
         db.flush()
-        # same auto-mapping as the single create: block + every ward of that block
+        # same auto-mapping as the single create: block + every ward of that block.
+        # map_all_wards=False -> only the block is mapped; the caller maps the exact wards.
         db.add(BlockSubcentreMapping(block_id=d["block_id"], sub_centre_id=obj.id))
-        for w in db.query(Ward).filter(Ward.block_id == d["block_id"]).all():
-            db.add(WardSubcentreMapping(ward_id=w.id, sub_centre_id=obj.id))
+        if map_all_wards:
+            for w in db.query(Ward).filter(Ward.block_id == d["block_id"]).all():
+                db.add(WardSubcentreMapping(ward_id=w.id, sub_centre_id=obj.id))
     elif entity == "usg-centres":
         obj = M(**vals, district_id=d["district_id"], is_private=bool(d.get("is_private")),
                 is_empanelled=True, block_id=(d["_block_ids"][0] if d.get("_block_ids") else None))
@@ -632,7 +634,7 @@ def _create(db, entity, cfg, d, user):
     return obj
 
 
-def execute_upload(db, entity, results, user, update_mode, selected_rows=None):
+def execute_upload(db, entity, results, user, update_mode, selected_rows=None,map_all_wards=True):
     """Applies the analysis. One SAVEPOINT per row. The caller commits."""
     if update_mode not in UPDATE_MODES:
         raise ValueError("Invalid update mode")
@@ -660,7 +662,7 @@ def execute_upload(db, entity, results, user, update_mode, selected_rows=None):
         if st == "new":
             try:
                 with db.begin_nested():
-                    obj = _create(db, entity, cfg, d, user)
+                    obj = _create(db, entity, cfg, d, user, map_all_wards=map_all_wards)
                 out["inserted"] += 1
                 out["created"].append(obj.id)
             except IntegrityError:

@@ -16,7 +16,7 @@ from sms_service import sms_service
 from sms_templates import get_sms_template
 from ivr_service import trigger_high_risk_call
 
-from services.tracking_service import get_tracking_info, get_gestational_weeks, ENHANCED_FROM_WEEK
+from services.tracking_service import get_tracking_info, get_gestational_weeks, ENHANCED_FROM_WEEK, get_weekly_schedule, get_weekly_visit_status
 from sqlalchemy import func
 logger = logging.getLogger(__name__)
 
@@ -71,23 +71,23 @@ def evaluate_high_risk(visit: ANCVisit) -> List[str]:
 
     return reasons
 
-def get_tracking_info(pw: PregnantWoman) -> dict:
-    """
-    Gestational age is calculated from LMP up to today.
-    28+ weeks and still active -> 'enhanced', otherwise 'regular'.
-    """
-    weeks = None
-    if pw and pw.lmp_date:
-        lmp = pw.lmp_date.date() if isinstance(pw.lmp_date, datetime) else pw.lmp_date
-        weeks = (date.today() - lmp).days // 7
+# def get_tracking_info(pw: PregnantWoman) -> dict:
+#     """
+#     Gestational age is calculated from LMP up to today.
+#     28+ weeks and still active -> 'enhanced', otherwise 'regular'.
+#     """
+#     weeks = None
+#     if pw and pw.lmp_date:
+#         lmp = pw.lmp_date.date() if isinstance(pw.lmp_date, datetime) else pw.lmp_date
+#         weeks = (date.today() - lmp).days // 7
 
-    is_delivered = bool(pw) and (not pw.is_active or pw.pregnancy_outcome is not None)
-    tracking_type = "enhanced" if (weeks is not None and 28 <= weeks <= 42 and not is_delivered) else "regular"
+#     is_delivered = bool(pw) and (not pw.is_active or pw.pregnancy_outcome is not None)
+#     tracking_type = "enhanced" if (weeks is not None and 28 <= weeks <= 42 and not is_delivered) else "regular"
 
-    return {
-        "gestational_weeks": weeks,
-        "tracking_type": tracking_type,
-    } 
+#     return {
+#         "gestational_weeks": weeks,
+#         "tracking_type": tracking_type,
+#     } 
 
 def _apply_high_risk_flag(db, pw: PregnantWoman, risk_reasons: List[str], current_user: User):
     """
@@ -293,6 +293,41 @@ async def create_anc_visit(
                 status_code=400,
                 detail=f"ANC visit #{visit_data.visit_number} is already recorded for this woman"
             )
+    # Visit sequence integrity (spec C)
+    existing_visits = db.query(ANCVisit.visit_number, ANCVisit.visit_date).filter(
+        ANCVisit.pregnant_woman_id == pw.id
+    ).all()
+
+    # Weekly visits: the same visit number cannot be recorded twice
+    # (visits below 28 weeks are already checked above)
+    if is_weekly_visit and any(n == visit_data.visit_number for n, _ in existing_visits):
+        raise HTTPException(
+            status_code=400,
+            detail=f"ANC visit #{visit_data.visit_number} is already recorded for this woman"
+        )
+
+    # Visit date must follow the visit order
+    for n, d in existing_visits:
+        if not d:
+            continue
+        if n < visit_data.visit_number and d > visit_data.visit_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Visit date cannot be earlier than ANC visit #{n} ({d.strftime('%d/%m/%Y')})"
+            )
+        if n > visit_data.visit_number and d < visit_data.visit_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Visit date cannot be later than ANC visit #{n} ({d.strftime('%d/%m/%Y')})"
+            )
+
+    # Visit cannot be before the woman's LMP
+    _lmp = pw.lmp_date.date() if isinstance(pw.lmp_date, datetime) else pw.lmp_date
+    if _lmp and visit_data.visit_date < _lmp:
+        raise HTTPException(
+            status_code=400,
+            detail="Visit date cannot be earlier than the LMP date"
+        )    
     # Create ANC visit
     new_visit = ANCVisit(
         **visit_data.dict(),
@@ -524,7 +559,39 @@ async def update_anc_visit(
                 raise HTTPException(status_code=403, detail="Not authorized")
     elif current_user.role == "block" and pw.block_id != current_user.block_id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+        # Validation on edit (same rules as create)
+    _changes = visit_update.dict(exclude_unset=True)
+    if "weight" in _changes:
+        _w = _changes["weight"]
+        if _w is None or _w <= 0 or _w > 250:
+            raise HTTPException(status_code=400, detail="Weight is required and must be between 1 and 250 kg")
+
+    if _changes.get("visit_date"):
+        _new_date = _changes["visit_date"]
+        # if _new_date > date.today():
+        #     raise HTTPException(status_code=400, detail="Visit date cannot be in the future")
+
+        _lmp = pw.lmp_date.date() if isinstance(pw.lmp_date, datetime) else pw.lmp_date
+        if _lmp and _new_date < _lmp:
+            raise HTTPException(status_code=400, detail="Visit date cannot be earlier than the LMP date")
+
+        _others = db.query(ANCVisit.visit_number, ANCVisit.visit_date).filter(
+            ANCVisit.pregnant_woman_id == pw.id,
+            ANCVisit.id != visit.id,
+        ).all()
+        for _n, _d in _others:
+            if not _d:
+                continue
+            if _n < visit.visit_number and _d > _new_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Visit date cannot be earlier than ANC visit #{_n} ({_d.strftime('%d/%m/%Y')})"
+                )
+            if _n > visit.visit_number and _d < _new_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Visit date cannot be later than ANC visit #{_n} ({_d.strftime('%d/%m/%Y')})"
+                )
     # Update fields
     old_values = get_entity_snapshot(visit)
     update_data = visit_update.dict(exclude_unset=True)
@@ -561,9 +628,11 @@ async def update_anc_visit(
         )
         db.commit()
 
-    # Visit update hui hai, to purane ANC due/overdue alerts band karo
-    for _ev in ("anc_due", "anc_overdue", "anc_visit_due", "anc_visit_missed"):
-        close_alerts(db, f"{_ev}:{pw.id}", note="ANC visit updated")
+    # Alerts tabhi band karo jab visit ki date ya next visit date badli ho.
+    # Sirf remarks / vitals edit karne se missed-visit alert band nahi hona chahiye.
+    if "visit_date" in update_data or "next_visit_date" in update_data:
+        for _ev in ("anc_due", "anc_overdue", "anc_visit_due", "anc_visit_missed"):
+            close_alerts(db, f"{_ev}:{pw.id}", note="ANC visit updated")
     db.commit()
 
     if risk_reasons and not pw.is_high_risk:
@@ -833,6 +902,31 @@ async def notify_overdue_anc_visits(
         raise HTTPException(status_code=403, detail="Not authorized")
     return send_overdue_notifications(db)
 
+def _scoped_pw_query(db: Session, current_user: User):
+    """Active (not delivered) pregnant women inside the user's jurisdiction."""
+    from models import UserWardMapping, WardSubcentreMapping
+    from sqlalchemy import or_
+    query = db.query(PregnantWoman).filter(
+        PregnantWoman.is_active == True,
+        PregnantWoman.pregnancy_outcome.is_(None),
+    )
+    if current_user.role == "district":
+        return query.filter(PregnantWoman.district_id == current_user.district_id)
+    if current_user.role == "block":
+        return query.filter(PregnantWoman.block_id == current_user.block_id)
+    user_wards = db.query(UserWardMapping.ward_id).filter(
+        UserWardMapping.user_id == current_user.id
+    ).all()
+    if user_wards:
+        return query.filter(PregnantWoman.ward_id.in_([w.ward_id for w in user_wards]))
+    mapped_ward_ids = db.query(WardSubcentreMapping.ward_id).filter(
+        WardSubcentreMapping.sub_centre_id == current_user.sub_centre_id
+    ).subquery()
+    return query.filter(or_(
+        PregnantWoman.ward_id.in_(mapped_ward_ids),
+        PregnantWoman.sub_centre_id == current_user.sub_centre_id,
+    ))
+
 @router.get("/overdue/list")
 async def get_overdue_visits(
     db: Session = Depends(get_db),
@@ -840,6 +934,11 @@ async def get_overdue_visits(
 ):
     """Get overdue ANC visits (past next_visit_date)"""
     today = date.today()
+    if current_user.role not in ["district", "block", "sub_centre"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Only District, Block or Sub-Centre users can access this"
+        )
     
     # Get last visits with next_visit_date < today
     query = db.query(ANCVisit).filter(
@@ -878,8 +977,14 @@ async def get_overdue_visits(
         
         if not newer_visit:  # Only include if no newer visit exists
             pw = db.query(PregnantWoman).filter(PregnantWoman.id == visit.pregnant_woman_id).first()
+             # Delivered / inactive women ki overdue list me zarurat nahi
+            if not pw or not pw.is_active or pw.pregnancy_outcome is not None:
+                continue
+            # 28+ weeks: weekly visits decide overdue (added below), not next_visit_date
+            if (get_gestational_weeks(pw, today) or 0) >= ENHANCED_FROM_WEEK:
+                continue
             days_overdue = (today - visit.next_visit_date).days
-            
+
             # ==================== BUG FIX SL NO. 49 ====================
             # Updated response structure to match standard API contract
             # Fixed field names: last_visit_number → visit_number, last_visit_date → visit_date, next_visit_due → next_visit_date
@@ -910,10 +1015,92 @@ async def get_overdue_visits(
                 "sub_centre_name": pw.sub_centre.name if pw.sub_centre else None,  # KEPT - Additional context
                 "gestational_weeks": tracking["gestational_weeks"],
                 "tracking_type": tracking["tracking_type"],
+                "source": "regular",
             })
+            # ---- 28th to 40th week: overdue = weekly visit due date has passed ----
+    weekly_pws = [
+        p for p in _scoped_pw_query(db, current_user).all()
+        if (get_gestational_weeks(p, today) or 0) >= ENHANCED_FROM_WEEK
+    ]
+    if weekly_pws:
+        last_visits = {}
+        for v in (db.query(ANCVisit)
+                  .filter(ANCVisit.pregnant_woman_id.in_([p.id for p in weekly_pws]))
+                  .order_by(ANCVisit.visit_date.asc(), ANCVisit.visit_number.asc()).all()):
+            last_visits[v.pregnant_woman_id] = v
+
+        for p in weekly_pws:
+            lv = last_visits.get(p.id)
+            weekly = get_weekly_visit_status(p, lv.visit_date if lv else None, today)
+            if weekly["anc_status"] != "overdue":
+                continue
+            row = {
+                "id": lv.id if lv else None,
+                "pregnant_woman_id": p.id,
+                "pregnant_woman_name": p.full_name,
+                "mobile_number": p.mobile_number,
+                "next_visit_date": weekly["next_due_visit"],
+                "days_overdue": weekly["days_overdue"],
+                "sub_centre_name": p.sub_centre.name if p.sub_centre else None,
+                "gestational_weeks": get_gestational_weeks(p, today),
+                "tracking_type": "enhanced",
+                "source": "weekly",
+                "created_at": lv.created_at.isoformat() if lv and lv.created_at else None,
+                "updated_at": lv.updated_at.isoformat() if lv and lv.updated_at else None,
+            }
+            for k in ("visit_number", "visit_date", "facility_name", "weight", "blood_pressure",
+                      "hemoglobin", "fundal_height", "fetal_heart_rate", "doctor_notes", "attended_by"):
+                row[k] = getattr(lv, k) if lv else None
+            row["referred_for_usg"] = lv.referred_for_usg if lv else False
+            row["is_emergency"] = lv.is_emergency if lv else False
+            result.append(row)
+
+    result.sort(key=lambda r: r["days_overdue"], reverse=True) 
+
             # ==================== END BUG FIX ====================
     
     return result
+
+@router.get("/weekly-schedule/{pw_id}")
+async def get_weekly_anc_schedule(
+    pw_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Auto generated weekly ANC schedule (28th to 40th week) of one pregnant woman."""
+    pw = db.query(PregnantWoman).filter(PregnantWoman.id == pw_id).first()
+    if not pw:
+        raise HTTPException(status_code=404, detail="Pregnant woman not found")
+
+    # Authorization check (same rules as the visit history endpoint)
+    if current_user.role == "district" and pw.district_id != current_user.district_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    elif current_user.role in ("block", "pmsma") and pw.block_id != current_user.block_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    elif current_user.role == "sub_centre":
+        if pw.sub_centre_id is not None and pw.sub_centre_id != current_user.sub_centre_id:
+            if pw.block_id != current_user.block_id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+    elif current_user.role not in ("district", "block", "sub_centre", "pmsma"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    visit_dates = [
+        d for (d,) in db.query(ANCVisit.visit_date)
+        .filter(ANCVisit.pregnant_woman_id == pw_id).all()
+    ]
+    slots = get_weekly_schedule(pw, visit_dates)
+
+    summary = {"total": len(slots)}
+    for key in ("completed", "due", "overdue", "missed", "upcoming"):
+        summary[key] = sum(1 for s in slots if s["status"] == key)
+
+    return {
+        "pregnant_woman_id": pw.id,
+        "pregnant_woman_name": pw.full_name,
+        "gestational_weeks": get_gestational_weeks(pw),
+        "summary": summary,
+        "slots": slots,
+    }
 
 @router.get("/{visit_id}")
 async def get_anc_visit(

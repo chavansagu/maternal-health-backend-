@@ -140,6 +140,61 @@ def _scoped_outcome_query(db: Session, user: User, pw_ids):
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard & Analytics"])
 
+@router.get("/kpi-snapshot")
+async def get_kpi_snapshot(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Today's command-center card numbers (written daily by the scheduler). District = whole district, Block = own block."""
+    from services.dashboard_snapshot_service import get_snapshot
+    if current_user.role == "district" and current_user.district_id:
+        return get_snapshot(db, current_user.district_id)
+    if current_user.role == "block" and current_user.block_id and current_user.district_id:
+        return get_snapshot(db, current_user.district_id, current_user.block_id)
+    raise HTTPException(status_code=403, detail="Not allowed")
+@router.get("/anc-compliance")
+async def get_anc_compliance_panel(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """ANC Compliance panel: rows with label, count and the `metric` to open the list. District = whole district, Block = own block."""
+    from services.dashboard_snapshot_service import get_snapshot, ANC_PANEL_ROWS
+    if current_user.role == "district" and current_user.district_id:
+        snap = get_snapshot(db, current_user.district_id)
+    elif current_user.role == "block" and current_user.block_id and current_user.district_id:
+        snap = get_snapshot(db, current_user.district_id, current_user.block_id)
+    else:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    counts = snap["metrics"].get("anc_compliance", {})
+    return {
+        "snapshot_date": snap["snapshot_date"],
+        "updated_at": snap["updated_at"],
+        "rows": [{"key": k, "label": l, "count": counts.get(k, 0), "metric": m}
+                 for k, l, m in ANC_PANEL_ROWS],
+    }
+@router.get("/cases")
+async def get_dashboard_cases(
+    metric: str,
+    search: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 25,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """List behind a command-center card (metric = card key, e.g. active_pw). District = whole district, Block = own block."""
+    from services.dashboard_list_service import get_cases, UnknownMetric
+    skip, limit = max(0, skip), max(1, min(limit, 100))
+    if current_user.role == "district" and current_user.district_id:
+        d, b = current_user.district_id, None
+    elif current_user.role == "block" and current_user.block_id and current_user.district_id:
+        d, b = current_user.district_id, current_user.block_id
+    else:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    try:
+        return get_cases(db, metric, d, b, search, skip, limit)
+    except UnknownMetric:
+        raise HTTPException(status_code=400, detail=f"Unknown metric: {metric}")
+    
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
     db: Session = Depends(get_db),

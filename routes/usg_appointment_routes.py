@@ -40,6 +40,7 @@ class USGAppointmentCreateForm(BaseModel):
     usg_centre_id: int
     scheduled_date: str  # Format: YYYY-MM-DDTHH:MM:SS
     appointment_type: str = "regular"  # regular or emergency
+    visit_type: str = "regular"  # regular or additional
     # Note: prescription_files are handled separately as multipart form data
     
     class Config:
@@ -290,10 +291,10 @@ async def schedule_usg_appointment(
     - appointment_type: "regular" or "emergency" (optional, default: "regular")
     - prescription_files: Multiple files allowed (.pdf, .jpg, .jpeg, .png)
     """
-    if current_user.role not in ["block", "pmsma"]:
+    if current_user.role not in ["sub_centre", "block", "pmsma"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Block or PMSMA users can schedule USG appointments"
+            detail="Only Sub-Centre (ANM), Block or PMSMA users can schedule USG appointments"
         )
 
     # Filter valid prescription files
@@ -327,6 +328,12 @@ async def schedule_usg_appointment(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pregnant woman not found"
+        )
+    # ANM (sub-centre) can schedule only for women of her own sub-centre
+    if current_user.role == "sub_centre" and pw.sub_centre_id != current_user.sub_centre_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized for this pregnant woman"
         )
 
     # Block USG scheduling if delivery already completed

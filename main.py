@@ -31,6 +31,7 @@ from routes import (
     report_program_routes,
     sms_routes,
     audit_routes,
+    beneficiary_audit_routes,
     notification_routes,
     delivery_referral_routes,
     ivr_routes,
@@ -202,6 +203,7 @@ app.include_router(pnc_reminder_routes.router, prefix=api_v1_prefix)
 app.include_router(district_analytics_routes.router, prefix=api_v1_prefix)
 app.include_router(enhanced_tracking_routes.router, prefix=api_v1_prefix)
 app.include_router(hrp_routes.router, prefix=api_v1_prefix)
+app.include_router(beneficiary_audit_routes.router, prefix=api_v1_prefix)
 
 # Run the application
 if __name__ == "__main__":

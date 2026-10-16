@@ -527,6 +527,9 @@ def _notify_edd_case(db, pw, case):
     if not event_type:
         return
 
+    # Red flag / critical cases: sabko urgent (matrix ka role_priority sirf plain "HRP near EDD" ke liye hai)
+    force_priority = "urgent" if case.priority in ("red_flag", "critical") else None
+
     raise_alert(
         db, event_type, pw,
         title=EDD_ALERT_TITLES.get(case.trigger_type, "EDD alert"),
@@ -536,6 +539,7 @@ def _notify_edd_case(db, pw, case):
         reference_type="MobilisationCase",
         action_url="/mobilisation-management",
         metadata={"pregnant_woman_name": pw.full_name, "trigger_type": case.trigger_type},
+        priority=force_priority,
     )
 
 EDD_CASE_TYPES = [
@@ -641,11 +645,12 @@ def job_generate_edd_action_cases():
 
                 t_type, t_priority, t_detail, t_action = trigger
 
-                # Normal/high cases: agar ANM mobilise kar chuki hai to roz dobara na banao
+                # Normal/high cases: agar ANM is woman ko kisi bhi EDD case me mobilise kar chuki hai
+                # (red-flag ho ya normal), to dobara naya case na banao
                 if t_priority in ("normal", "high"):
                     done = db.query(MobilisationCase.id).filter(
                         MobilisationCase.pregnant_woman_id == pw.id,
-                        MobilisationCase.trigger_type == t_type,
+                        MobilisationCase.trigger_type.in_(EDD_CASE_TYPES),
                         MobilisationCase.status == "mobilised",
                     ).first()
                     if done:
@@ -996,6 +1001,23 @@ def job_escalate_alerts():
     except Exception as e:
         logger.error(f"[Scheduler] Alert escalation FAILED — {str(e)}")
 
+def job_daily_dashboard_snapshot():
+    """Job: store today's District/Block dashboard KPI numbers. Runs daily just after midnight."""
+    logger.info(f"[Scheduler] Dashboard snapshot started at {datetime.now()}")
+    try:
+        from database import SessionLocal
+        from services.dashboard_snapshot_service import run_daily_snapshot
+
+        db = SessionLocal()
+        try:
+            rows = run_daily_snapshot(db)
+            logger.info(f"[Scheduler] Dashboard snapshot DONE — {rows} row(s)")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Scheduler] Dashboard snapshot FAILED — {str(e)}")
+
+
 
 def start_scheduler():
     """
@@ -1097,6 +1119,15 @@ def start_scheduler():
         name="Alert Escalation (Sub-centre → Block → District)",
         replace_existing=True,
         misfire_grace_time=1800
+    )
+    # Job 10: Dashboard KPI snapshot — daily at 00:10
+    scheduler.add_job(
+        func=job_daily_dashboard_snapshot,
+        trigger=CronTrigger(hour=0, minute=10),
+        id="daily_dashboard_snapshot",
+        name="Dashboard KPI Snapshot (daily)",
+        replace_existing=True,
+        misfire_grace_time=3600
     )
     scheduler.start()
     logger.info("[Scheduler] APScheduler started successfully")

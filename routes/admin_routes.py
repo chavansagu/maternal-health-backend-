@@ -33,6 +33,8 @@ from audit_utils import (
 from services.notification_service import NotificationService
 import admin_bulk_upload_service as admin_bulk
 import admin_masters_bulk_service as admin_masters
+import client_template_reader as client_reader
+import client_template_service as client_tpl
 
 logger = logging.getLogger(__name__)
 
@@ -1700,12 +1702,22 @@ async def download_masters_template(
         bq = bq.filter(Block.district_id == current_user.district_id)
     district_names = [d.name for d in dq.order_by(District.name).all()]
     block_names = [b.name for b in bq.order_by(Block.name).all()]
-    content = admin_masters.build_template_xlsx(district_names, block_names)
+    content = client_tpl.build_client_template_xlsx(district_names[0] if district_names else "", block_names)
     return StreamingResponse(
         io.BytesIO(content),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=administrative_masters_template.xlsx"}
+        headers={"Content-Disposition": "attachment; filename=user_bulk_upload_template.xlsx"}
     )
+def _client_masters_parse(file: UploadFile):
+    """Reads the client's 4-sheet workbook. File-level problems -> HTTP 400."""
+    try:
+        parsed = client_reader.parse_client_workbook(file.filename, file.file.read())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not parsed["groups"] and not parsed["errors"]:
+        raise HTTPException(status_code=400, detail="The file has no data rows")
+    return parsed
+
 
 @router.post("/bulk-upload-masters/validate", tags=["Bulk Upload"])
 def masters_bulk_validate(
@@ -1715,23 +1727,25 @@ def masters_bulk_validate(
 ):
     """STEP 1 (dry run): validate the whole file, classify every row. Saves nothing."""
     _masters_checks(file, current_user)
+    parsed = _client_masters_parse(file)
     try:
-        df = admin_masters.read_masters_dataframe(file.filename, file.file.read())
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    try:
-        rows, _per_entity = admin_masters.analyze_masters(db, df, current_user)
+        catalog = client_tpl.load_catalog(db, current_user, parsed)
+        analysis = client_tpl.analyze_client_groups(parsed, catalog)
         db.rollback()  # dry run: nothing pending
         return {
-            "entity": "masters",
+            "entity": "client_users_masters",
             "file_name": file.filename,
-            "total_records": len(rows),
-            "summary": admin_masters.summarize(rows),
-            "rows": admin_masters.serialize_rows(rows),
+            "total_records": len(analysis["rows"]),
+            "summary": analysis["summary"],
+            "rows": analysis["rows"],
+            "sheets_ignored": parsed["sheets_ignored"],
         }
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
-        logger.error(f"[MASTERS BULK VALIDATE] {e} | {traceback.format_exc()}")
+        logger.error(f"[CLIENT MASTERS VALIDATE] {e} | {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error validating file: {str(e)}")
 
 
@@ -1739,84 +1753,64 @@ def masters_bulk_validate(
 def masters_bulk_confirm(
     request: Request,
     file: UploadFile = File(...),
-    update_mode: str = Form("fill_empty"),
-    selected_rows: Optional[str] = Form(None),
+    update_mode: str = Form("fill_empty"),          # kept for the old client; not used any more
+    selected_rows: Optional[str] = Form(None),      # kept for the old client; not used any more
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """STEP 2: create everything in dependency order (block -> ward -> sub-centre -> USG -> DP -> PMSMA)."""
+    """STEP 2: create centres, wards and users. The file is re-analysed here (the preview is never trusted)."""
     _masters_checks(file, current_user)
-    if update_mode not in admin_bulk.UPDATE_MODES:
-        raise HTTPException(status_code=400,
-                            detail=f"update_mode must be one of {', '.join(admin_bulk.UPDATE_MODES)}")
-    rows_filter = None
-    if selected_rows:
-        try:
-            rows_filter = {int(x) for x in json.loads(selected_rows)}
-        except Exception:
-            raise HTTPException(status_code=400, detail="selected_rows must be a JSON list of row numbers")
-    try:
-        df = admin_masters.read_masters_dataframe(file.filename, file.file.read())
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    parsed = _client_masters_parse(file)
 
-    audit_name = "AdminMasters"
+    audit_name = "ClientUsersMasters"
     bulk_upload = BulkUpload(file_name=f"[{audit_name}] {file.filename}"[:255], uploaded_by=current_user.id,
-                             total_records=len(df), processing_status="processing")
+                             total_records=parsed["total_rows"], processing_status="processing")
     db.add(bulk_upload)
     db.commit()
     db.refresh(bulk_upload)
-    logger.info(f"[MASTERS BULK] Started | file='{file.filename}' | rows={len(df)} | user={current_user.id} | mode={update_mode}")
+    logger.info(f"[CLIENT MASTERS BULK] Started | file='{file.filename}' | rows={parsed['total_rows']} | user={current_user.id}")
 
     try:
-        # Re-analyse server-side: never trust the client's preview.
-        rows, per_entity = admin_masters.analyze_masters(db, df, current_user)
-        bad_rows = [r for r in rows if r["status"] == "invalid" and not r["_data"]]  # unknown / missing record_type
-        out = admin_masters.execute_masters(db, per_entity, current_user, update_mode, rows_filter, bad_rows)
+        catalog = client_tpl.load_catalog(db, current_user, parsed)
+        analysis = client_tpl.analyze_client_groups(parsed, catalog)
+        out = client_tpl.execute_client_plan(db, current_user, analysis)
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"[MASTERS BULK] FAILED | {e} | {traceback.format_exc()}")
+        logger.error(f"[CLIENT MASTERS BULK] FAILED | {e} | {traceback.format_exc()}")
         bulk_upload.processing_status = "failed"
         bulk_upload.error_log = f"{type(e).__name__}: {str(e)[:500]}"
         bulk_upload.completed_at = datetime.now()
         db.commit()
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
-    inserted, updated = out["inserted"], out["updated"]
-    duplicate, failed = out["duplicate"], out["failed"]
-    bulk_upload.successful_records = inserted + updated
-    bulk_upload.failed_records = failed
-    bulk_upload.duplicate_records = duplicate
+    bulk_upload.successful_records = out["users"]
+    bulk_upload.failed_records = out["failed"]
+    bulk_upload.duplicate_records = 0
     bulk_upload.processing_status = "completed"
     bulk_upload.error_log = "\n".join(out["errors"]) if out["errors"] else None
     bulk_upload.completed_at = datetime.now()
     db.commit()
 
     ip_address, user_agent = get_client_info(request)
-    for ent_audit, rec_id, old_vals, new_vals in out["audit"]:
-        log_audit(db, current_user.id, "BULK_UPDATE", ent_audit, rec_id,
-                  old_vals, {**new_vals, "bulk_upload_id": bulk_upload.id}, ip_address, user_agent)
     log_bulk_action(
-        db, current_user.id, "BULK_UPLOAD", audit_name, inserted + updated,
-        {"total_records": len(df), "inserted": inserted, "updated": updated, "failed": failed,
-         "duplicate": duplicate, "update_mode": update_mode, "by_type": out["by_type"],
-         "bulk_upload_id": bulk_upload.id},
+        db, current_user.id, "BULK_UPLOAD", audit_name, out["users"] + out["centres"] + out["wards"]+ out["blocks"],
+        {"total_rows": parsed["total_rows"],"blocks": out["blocks"], "centres": out["centres"], "wards": out["wards"],
+         "users": out["users"], "failed": out["failed"], "bulk_upload_id": bulk_upload.id},
         ip_address, user_agent
     )
 
     return {
         "message": "Bulk upload completed",
-        "entity": "masters",
-        "total_records": len(df),
-        "inserted": inserted,
-        "updated": updated,
-        "successful": inserted + updated,
-        "failed": failed,
-        "duplicate": duplicate,
-        "by_type": out["by_type"],
+        "entity": "client_users_masters",
+        "total_records": parsed["total_rows"],
+        "blocks": out["blocks"],
+        "centres": out["centres"],
+        "wards": out["wards"],
+        "users": out["users"],
+        "failed": out["failed"],
+        "successful": out["users"],
         "bulk_upload_id": bulk_upload.id,
         "failed_rows": out["failed_rows"],
-        "total": len(df),
         "errors": out["errors"],
     }

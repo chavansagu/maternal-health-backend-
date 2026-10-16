@@ -386,7 +386,19 @@ class ANCVisitBase(BaseSchema):
     facility_name: Optional[str] = None
 
 class ANCVisitCreate(ANCVisitBase):
-    pass
+    @validator("weight", always=True)
+    def weight_required(cls, v):
+        if v is None:
+            raise ValueError("Weight is required")
+        if v <= 0 or v > 250:
+            raise ValueError("Weight must be between 1 and 250 kg")
+        return v
+
+    # @validator("visit_date")
+    # def visit_date_not_future(cls, v):
+    #     if v > date.today():
+    #         raise ValueError("Visit date cannot be in the future")
+    #     return v
 
 class ANCVisitUpdate(BaseSchema):
     visit_date: Optional[date] = None

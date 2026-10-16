@@ -1207,4 +1207,21 @@ class HRPStatusLog(Base):
 
     pregnant_woman = relationship("PregnantWoman")
     condition = relationship("HRPCondition")
-    changed_by_user = relationship("User", foreign_keys=[changed_by])    
+    changed_by_user = relationship("User", foreign_keys=[changed_by])   
+
+class DashboardSnapshot(Base):
+    """Daily KPI numbers for the District / Block dashboard cards (block_id 0 = whole district)."""
+    __tablename__ = "dashboard_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    snapshot_date = Column(Date, nullable=False, index=True)
+    district_id = Column(Integer, nullable=False, index=True)
+    block_id = Column(Integer, nullable=False, default=0, server_default="0")
+    metrics = Column(Text, nullable=False)  # JSON {kpi_key: number}
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "district_id", "block_id", name="uq_dashboard_snapshot_scope"),
+    ) 
+

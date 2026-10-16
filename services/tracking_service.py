@@ -192,7 +192,91 @@ def get_weekly_visit_status(pw, last_anc_date=None, today=None) -> dict:
     return result   
 
 
+# ---------------------------------------------------------------------------
+# Weekly ANC schedule (28th -> 40th week), auto generated, read only
+# ---------------------------------------------------------------------------
+WEEKLY_SLOT_LABELS = {
+    "completed": "Completed",
+    "due": "Due",
+    "overdue": "Overdue",
+    "missed": "Missed",
+    "upcoming": "Upcoming",
+}
 
+
+def get_weekly_schedule(pw, visit_dates=None, today=None) -> list:
+    """
+    One slot per week from the 28th to the 40th week (13 slots), built from LMP / EDD.
+    Slot of week N : due on the first day of that week, can be done until 6 days later.
+      completed : an ANC visit was recorded inside the slot
+      due       : not done yet, due date is today or within DUE_SOON_DAYS
+      overdue   : due date passed, slot window still open (can still be done)
+      missed    : slot window closed without a visit
+      upcoming  : due date is still more than DUE_SOON_DAYS away
+    visit_dates : list of dates of ALL ANC visits of this woman.
+    Returns [] for delivered women or when LMP / EDD is missing.
+    """
+    today = today or date.today()
+    ref = _reference_date(pw)
+    if ref is None or is_delivered(pw):
+        return []
+
+    dates = sorted(_as_date(d) for d in (visit_dates or []) if d)
+    slots = []
+    for week in range(ENHANCED_FROM_WEEK, LAST_EXPECTED_WEEK + 1):
+        start = ref + timedelta(weeks=week)
+        end = start + timedelta(days=VISIT_GAP_DAYS - 1)
+        done_on = next((d for d in dates if start <= d <= end), None)
+
+        if done_on:
+            status = "completed"
+        elif today > end:
+            status = "missed"
+        elif today > start:
+            status = "overdue"
+        elif (start - today).days <= DUE_SOON_DAYS:
+            status = "due"
+        else:
+            status = "upcoming"
+
+        slots.append({
+            "week": week,
+            "due_date": start,
+            "window_end": end,
+            "status": status,
+            "status_label": WEEKLY_SLOT_LABELS[status],
+            "visit_date": done_on,
+            "days_overdue": (today - start).days if status in ("overdue", "missed") else 0,
+        })
+    return slots
+def get_anc_compliance_flags(pw, visit_dates=None, today=None) -> dict:
+    """
+    ANC Compliance panel: which rows ONE woman counts in.
+    Only still-pregnant women who reached the 28th week are considered (others: all False).
+      completed  : this week's slot (latest slot whose due date has come) has a visit
+      due        : some slot is "due" (due today / within DUE_SOON_DAYS) and not done
+      overdue    : some slot is "overdue" (due date passed, window still open)
+      w28_done   : at least one completed slot (ANC done since the 28th week)
+      w28_missed : at least one missed slot (window closed without a visit)
+    A woman can be in more than one row (e.g. overdue + w28_done).
+    """
+    today = today or date.today()
+    flags = {"completed": False, "due": False, "overdue": False,
+             "w28_done": False, "w28_missed": False}
+    weeks = get_gestational_weeks(pw, today)
+    if weeks is None or weeks < ENHANCED_FROM_WEEK:
+        return flags
+    slots = get_weekly_schedule(pw, visit_dates, today)
+    if not slots:
+        return flags
+    statuses = {s["status"] for s in slots}
+    current = [s for s in slots if s["due_date"] <= today][-1]
+    flags["completed"] = current["status"] == "completed"
+    flags["due"] = "due" in statuses
+    flags["overdue"] = "overdue" in statuses
+    flags["w28_done"] = "completed" in statuses
+    flags["w28_missed"] = "missed" in statuses
+    return flags
 # ---- EDD buckets (config: yahin se badal sakte hain) ----
 # (key, label, min_days, max_days)  -> days_remaining ke hisaab se
 EDD_BUCKETS = [
@@ -256,17 +340,17 @@ EDD_ACTION_TYPES = [
 DELIVERY_STAGE_TRIGGERS = EDD_ACTION_TYPES + ["hrp_unreferred"]
 
 
-def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
-    """Delivery record hone par delivery-related open cases band. Commit caller karega."""
-    from models import MobilisationCase
+# def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
+#     """Delivery record hone par delivery-related open cases band. Commit caller karega."""
+#     from models import MobilisationCase
 
-    cases = db.query(MobilisationCase).filter(
-        MobilisationCase.pregnant_woman_id == pregnant_woman_id,
-        MobilisationCase.trigger_type.in_(trigger_types or DELIVERY_STAGE_TRIGGERS),
-        MobilisationCase.status.in_(["pending", "escalated", "mobilised"]),
-    ).all()
-    for c in cases:
-        c.status = "closed"
+#     cases = db.query(MobilisationCase).filter(
+#         MobilisationCase.pregnant_woman_id == pregnant_woman_id,
+#         MobilisationCase.trigger_type.in_(trigger_types or DELIVERY_STAGE_TRIGGERS),
+#         MobilisationCase.status.in_(["pending", "escalated", "mobilised"]),
+#     ).all()
+#     for c in cases:
+#         c.status = "closed"
 
 
 def close_cases_on_admission(db, pregnant_woman_id, user_id, dp_id, admitted_at=None):
@@ -312,6 +396,22 @@ def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
         MobilisationCase.pregnant_woman_id == pregnant_woman_id,
         MobilisationCase.trigger_type.in_(trigger_types or EDD_ACTION_TYPES),
         MobilisationCase.status.in_(["pending", "escalated"]),
+    ).all()
+    for c in cases:
+        c.status = "closed"
+
+    # Required entry done -> close the alerts of these cases (spec M). Commit stays with the caller.
+    from services.alert_rules import close_case_alerts
+    close_case_alerts(db, [c.id for c in cases], note="Required entry recorded", commit=False)
+
+def close_edd_cases(db, pregnant_woman_id, trigger_types=None):
+    """Delivery record hone par delivery-related open cases band + unke alerts band. Commit caller karega."""
+    from models import MobilisationCase
+
+    cases = db.query(MobilisationCase).filter(
+        MobilisationCase.pregnant_woman_id == pregnant_woman_id,
+        MobilisationCase.trigger_type.in_(trigger_types or DELIVERY_STAGE_TRIGGERS),
+        MobilisationCase.status.in_(["pending", "escalated", "mobilised"]),
     ).all()
     for c in cases:
         c.status = "closed"

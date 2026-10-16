@@ -33,9 +33,10 @@ ESCALATION_HOURS: Dict[str, Dict[str, int]] = {
 }
 
 # Notification matrix from spec M.
-# roles     = who receives it (in-app)
-# priority  = notification priority
-# escalate  = True -> escalation job moves it up the chain if still unresolved
+# roles         = who receives it (in-app)
+# priority      = notification priority (default for every role)
+# role_priority = optional per-role override, e.g. {"block": "high"}
+# escalate      = True -> escalation job moves it up the chain if still unresolved
 ALERT_MATRIX: Dict[str, Dict[str, Any]] = {
     "anc_due":                 {"roles": ["sub_centre"],                      "priority": "normal",   "escalate": False},
     "anc_overdue":             {"roles": ["sub_centre", "block"],             "priority": "high",     "escalate": False},
@@ -45,8 +46,11 @@ ALERT_MATRIX: Dict[str, Dict[str, Any]] = {
     "pmsma_due":               {"roles": ["sub_centre", "pmsma"],             "priority": "normal",   "escalate": False},
     "usg_scheduled":           {"roles": ["usg_centre", "pmsma", "sub_centre"], "priority": "normal", "escalate": False},
     "usg_high_risk_finding":   {"roles": ["sub_centre", "block", "district"], "priority": "high",     "escalate": False},
-    "edd_approaching":         {"roles": ["sub_centre", "block", "district"], "priority": "normal",   "escalate": False},
-    "hrp_near_edd":            {"roles": ["sub_centre", "block", "district"], "priority": "urgent",   "escalate": True},
+    # Near EDD: reminder to Sub-centre user only (spec I)
+    "edd_approaching":         {"roles": ["sub_centre"],                      "priority": "normal",   "escalate": False},
+    # HRP + near EDD: immediate (urgent) alert to Sub-centre; high priority for Block and District (spec I)
+    "hrp_near_edd":            {"roles": ["sub_centre", "block", "district"], "priority": "urgent",   "escalate": True,
+                                "role_priority": {"block": "high", "district": "high"}},
     "edd_today_not_admitted":  {"roles": ["sub_centre", "block", "district"], "priority": "urgent",   "escalate": True},
     "edd_crossed_no_delivery": {"roles": ["sub_centre", "block", "district"], "priority": "urgent",   "escalate": True},
     "mobilisation_pending":    {"roles": ["sub_centre", "block"],             "priority": "high",     "escalate": True},
@@ -140,6 +144,7 @@ def raise_alert(
     """
     Raise an alert per the notification matrix.
     - Recipients come from ALERT_MATRIX[event_type] (or only_roles when escalating).
+    - Priority: explicit `priority` arg > matrix `role_priority` for that role > matrix default.
     - If alert_key is given, a user who already has an UNRESOLVED alert with that key is skipped.
     - Every notification is written to escalation_logs (action='notified').
     """
@@ -149,7 +154,7 @@ def raise_alert(
         return []
 
     roles = only_roles or rule["roles"]
-    prio = priority or rule["priority"]
+    role_prio = rule.get("role_priority", {})
     meta = json.dumps(metadata) if metadata else None
     created: List[Notification] = []
     seen = set()
@@ -169,6 +174,8 @@ def raise_alert(
                     ).first()
                     if exists:
                         continue
+                # explicit priority > per-role priority from the matrix > matrix default
+                prio = priority or role_prio.get(role) or rule["priority"]
                 n = Notification(
                     user_id=uid, title=title, message=message,
                     notification_type=event_type, category="alert", priority=prio,
